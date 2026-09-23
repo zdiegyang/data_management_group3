@@ -1,6 +1,10 @@
 """Step 7 of getting-started: ONE record per source from bronze -> silver -> gold -> ml, then traced back.
 
-Run from starter/:  python -m quantum_lake_student.slice_demo
+How to run:
+1. Do the usual startup with docker and all that
+2. Go on localhost 8080 or wherever you have your jupyter stuff
+3. Open terminal go to folder location and run "python slice_demo.py"
+DISCLAIMER! if it doesn;t work, it;s on you gang
 
 LAKE_BACKEND=minio (default in the workspace container): Bronze is READ from the MinIO bucket with the
 MinIO client (byte-range requests, so zips are never fully downloaded/extracted); the slice's Silver/ML
