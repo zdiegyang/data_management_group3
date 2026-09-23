@@ -6,4 +6,5 @@
 starter/lake/
 starter/reports/
 starter/.coverage
-
+.idea
+.venv
