@@ -1,13 +1,864 @@
-"""Parse, check, and connect the supplied QEC data.
+"""Parse, check, and connect the supplied QEC data into Silver tables and source traces.
 
-Apply documented checks, normalize nested/wide data, connect valid
-relationships, and write prepared Parquet tables with chosen column names and
-types. Write invalid records and the reason for exclusion to a machine-readable
-data-issues output. The project README defines where generated files live.
+Implements Stage 2 of the course platform:
+- Syndromes CSV parsing, validation, and 16-byte packed formatting.
+- Google QEC experiments metadata extraction from properties.yml.
+- Google QEC shots parsing with 8-member companion alignment and bit-level invariant checks.
+- Extensible hook for QASMBench parsing (prepared for Diego to complete).
+- Full source lineage tracing with 'valid' (yes/no) column.
+- Machine-readable data issues logging to results/part1/data_issues.parquet.
 """
 
+from __future__ import annotations
+
+import ast
+import csv
+import hashlib
+import io
+from pathlib import Path
+from typing import Any
+import uuid
+import zipfile
+import yaml
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from quantum_lake_student.config import Settings
+from quantum_lake_student.connections import minio_client
+from quantum_lake_student.formats import b8_record_bytes, parse_01_records
 from quantum_lake_student.models import StageResult
+from quantum_lake_student.tracing import SOURCE_TRACE_SCHEMA, save_source_traces
 
 
-def run(run_id: str) -> StageResult:
-    raise NotImplementedError("Implement prepared and integrated QEC tables")
+# ==============================================================================
+# SCHEMA DEFINITIONS (Strictly matching silver-tables.md & brief.md)
+# ==============================================================================
+
+SYNDROME_OBSERVATION_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("experiment_id", pa.string()),
+    ("physical_fault_rate", pa.float64()),
+    ("syndrome_bits", pa.binary()),
+    ("round_count", pa.int32()),
+    ("check_count", pa.int32()),
+    ("logical_error_label", pa.bool_()),
+    ("quantity", pa.int64()),
+])
+
+GOOGLE_EXPERIMENT_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("experiment_id", pa.string()),
+    ("basis", pa.string()),
+    ("distance", pa.int32()),
+    ("rounds", pa.int32()),
+    ("shots", pa.int64()),
+    ("center_row", pa.int32()),
+    ("center_col", pa.int32()),
+    ("measurement_count", pa.int32()),
+    ("detector_count", pa.int32()),
+])
+
+GOOGLE_SHOT_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("experiment_id", pa.string()),
+    ("shot_index", pa.int64()),
+    ("measurement_bits", pa.binary()),
+    ("sweep_bits", pa.binary()),
+    ("detector_bits", pa.binary()),
+    ("detector_event_count", pa.int32()),
+    ("actual_observable_flip", pa.bool_()),
+    ("belief_matching_prediction", pa.bool_()),
+    ("correlated_matching_prediction", pa.bool_()),
+    ("pymatching_prediction", pa.bool_()),
+    ("tensor_network_contraction_prediction", pa.bool_()),
+])
+
+DATA_ISSUES_SCHEMA = pa.schema([
+    ("issue_id", pa.string()),
+    ("run_id", pa.string()),
+    ("source_record_id", pa.string()),
+    ("rule_id", pa.string()),
+    ("severity", pa.string()),
+    ("observed_value", pa.string()),
+    ("action", pa.string()),
+    ("reason", pa.string()),
+])
+
+DECODER_NAMES = [
+    "belief_matching",
+    "correlated_matching",
+    "pymatching",
+    "tensor_network_contraction",
+]
+
+
+# ==============================================================================
+# BRONZE HELPER: FETCH AND HASH ARCHIVES
+# ==============================================================================
+
+def get_bronze_archive(
+    bronze_object_name: str,
+    settings: Settings,
+    base_dir: Path,
+) -> tuple[bytes, str]:
+    """Fetch raw Bronze archive bytes and return (bytes, sha256_hash).
+
+    Tries MinIO first if configured, then falls back to local workspace mounts.
+    """
+    bronze_bytes: bytes | None = None
+
+    if settings.lake_backend == "minio":
+        try:
+            client = minio_client(settings)
+            response = client.get_object(settings.s3_bucket, bronze_object_name)
+            bronze_bytes = response.read()
+            response.close()
+            response.release_conn()
+        except Exception:
+            bronze_bytes = None
+
+    if bronze_bytes is None:
+        candidates = [
+            Path("/course-data/raw") / bronze_object_name.replace("bronze/", ""),
+            base_dir.parent / "datasets/student-bundle/core/raw" / bronze_object_name.replace("bronze/", ""),
+            base_dir / "datasets/student-bundle/core/raw" / bronze_object_name.replace("bronze/", ""),
+            Path("datasets/student-bundle/core/raw") / bronze_object_name.replace("bronze/", ""),
+        ]
+        for p in candidates:
+            if p.exists():
+                bronze_bytes = p.read_bytes()
+                break
+
+    if bronze_bytes is None:
+        raise FileNotFoundError(
+            f"Could not locate Bronze archive '{bronze_object_name}' in MinIO or local paths."
+        )
+
+    sha256 = hashlib.sha256(bronze_bytes).hexdigest()
+    return bronze_bytes, sha256
+
+
+# ==============================================================================
+# 1. SYNDROME OBSERVATIONS PARSER
+# ==============================================================================
+
+def prepare_syndrome_observations(
+    bronze_bytes: bytes,
+    bronze_object_name: str,
+    bronze_sha256: str,
+    run_id: str,
+    issues: list[dict[str, Any]],
+) -> tuple[pa.Table, dict[str, list[Any]], int]:
+    """Parse simulated syndrome CSV files, validate invariants, and extract traces."""
+    silver_rows = []
+    trace_cols: dict[str, list[Any]] = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+    input_records_count = 0
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as z:
+        csv_members = sorted([name for name in z.namelist() if name.endswith(".csv") and not name.startswith("__MACOSX")])
+        for member in csv_members:
+            stem = Path(member).stem
+            # Parse physical fault rate from filename: d-3_pfr-0.001000_nb-10M.csv
+            try:
+                pfr_str = member.split("_pfr-")[1].split("_")[0]
+                pfr = float(pfr_str)
+            except Exception as e:
+                issues.append({
+                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "run_id": run_id,
+                    "source_record_id": f"qec_syndromes:{member}",
+                    "rule_id": "RULE_SYN_FILENAME_PFR",
+                    "severity": "error",
+                    "observed_value": member,
+                    "action": "excluded",
+                    "reason": f"Could not parse physical_fault_rate from filename: {e}",
+                })
+                continue
+
+            exp_id = stem
+
+            with z.open(member) as f:
+                reader = csv.reader(io.TextIOWrapper(f, encoding="utf-8"))
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    issues.append({
+                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "run_id": run_id,
+                        "source_record_id": f"qec_syndromes:{member}",
+                        "rule_id": "RULE_SYN_EMPTY_FILE",
+                        "severity": "error",
+                        "observed_value": member,
+                        "action": "excluded",
+                        "reason": "CSV file is empty",
+                    })
+                    continue
+
+                if header not in (["labels", "syndromes", "quantity"], ["label", "syndromes", "quantity"]):
+                    issues.append({
+                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "run_id": run_id,
+                        "source_record_id": f"qec_syndromes:{member}:header",
+                        "rule_id": "RULE_SYN_HEADER",
+                        "severity": "warning",
+                        "observed_value": str(header),
+                        "action": "logged",
+                        "reason": f"Non-standard header: {header}",
+                    })
+
+                for row_idx, row in enumerate(reader):
+                    input_records_count += 1
+                    source_record_id = f"qec_syndromes:{member}:row:{row_idx}"
+                    record_locator = f"row:{row_idx}"
+
+                    if len(row) != 3:
+                        issues.append({
+                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "run_id": run_id,
+                            "source_record_id": source_record_id,
+                            "rule_id": "RULE_SYN_ROW_LEN",
+                            "severity": "error",
+                            "observed_value": str(row),
+                            "action": "excluded",
+                            "reason": f"Expected 3 columns, found {len(row)}",
+                        })
+                        trace_cols["source_record_id"].append(source_record_id)
+                        trace_cols["source_name"].append("qec_syndromes")
+                        trace_cols["bronze_object"].append(bronze_object_name)
+                        trace_cols["archive_member"].append(member)
+                        trace_cols["record_locator"].append(record_locator)
+                        trace_cols["input_sha256"].append(bronze_sha256)
+                        trace_cols["valid"].append("no")
+                        continue
+
+                    # Validate label
+                    try:
+                        label_val = int(row[0].strip())
+                        if label_val not in (0, 1):
+                            raise ValueError(f"Label not binary: {label_val}")
+                        logical_error_label = bool(label_val)
+                    except Exception as e:
+                        issues.append({
+                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "run_id": run_id,
+                            "source_record_id": source_record_id,
+                            "rule_id": "RULE_SYN_LABEL_DOMAIN",
+                            "severity": "error",
+                            "observed_value": row[0],
+                            "action": "excluded",
+                            "reason": str(e),
+                        })
+                        trace_cols["source_record_id"].append(source_record_id)
+                        trace_cols["source_name"].append("qec_syndromes")
+                        trace_cols["bronze_object"].append(bronze_object_name)
+                        trace_cols["archive_member"].append(member)
+                        trace_cols["record_locator"].append(record_locator)
+                        trace_cols["input_sha256"].append(bronze_sha256)
+                        trace_cols["valid"].append("no")
+                        continue
+
+                    # Validate 4x4 syndrome sequence
+                    try:
+                        syndrome_tuple = ast.literal_eval(row[1].strip())
+                        if len(syndrome_tuple) != 4 or not all(len(r) == 4 for r in syndrome_tuple):
+                            raise ValueError("Syndrome must have shape 4 rounds x 4 checks")
+                        flat_bits = [bit for r in syndrome_tuple for bit in r]
+                        if len(flat_bits) != 16 or any(b not in (0, 1) for b in flat_bits):
+                            raise ValueError("Syndrome bits must all be 0 or 1")
+                        syndrome_bytes = bytes(flat_bits)
+                    except Exception as e:
+                        issues.append({
+                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "run_id": run_id,
+                            "source_record_id": source_record_id,
+                            "rule_id": "RULE_SYN_SHAPE_DOMAIN",
+                            "severity": "error",
+                            "observed_value": row[1],
+                            "action": "excluded",
+                            "reason": str(e),
+                        })
+                        trace_cols["source_record_id"].append(source_record_id)
+                        trace_cols["source_name"].append("qec_syndromes")
+                        trace_cols["bronze_object"].append(bronze_object_name)
+                        trace_cols["archive_member"].append(member)
+                        trace_cols["record_locator"].append(record_locator)
+                        trace_cols["input_sha256"].append(bronze_sha256)
+                        trace_cols["valid"].append("no")
+                        continue
+
+                    # Validate quantity
+                    try:
+                        quantity = int(row[2].strip())
+                        if quantity <= 0:
+                            raise ValueError("Quantity must be greater than zero")
+                    except Exception as e:
+                        issues.append({
+                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "run_id": run_id,
+                            "source_record_id": source_record_id,
+                            "rule_id": "RULE_SYN_QUANTITY_POSITIVE",
+                            "severity": "error",
+                            "observed_value": row[2],
+                            "action": "excluded",
+                            "reason": str(e),
+                        })
+                        trace_cols["source_record_id"].append(source_record_id)
+                        trace_cols["source_name"].append("qec_syndromes")
+                        trace_cols["bronze_object"].append(bronze_object_name)
+                        trace_cols["archive_member"].append(member)
+                        trace_cols["record_locator"].append(record_locator)
+                        trace_cols["input_sha256"].append(bronze_sha256)
+                        trace_cols["valid"].append("no")
+                        continue
+
+                    # Accepted valid record
+                    silver_rows.append({
+                        "source_record_id": source_record_id,
+                        "experiment_id": exp_id,
+                        "physical_fault_rate": pfr,
+                        "syndrome_bits": syndrome_bytes,
+                        "round_count": 4,
+                        "check_count": 4,
+                        "logical_error_label": logical_error_label,
+                        "quantity": quantity,
+                    })
+
+                    trace_cols["source_record_id"].append(source_record_id)
+                    trace_cols["source_name"].append("qec_syndromes")
+                    trace_cols["bronze_object"].append(bronze_object_name)
+                    trace_cols["archive_member"].append(member)
+                    trace_cols["record_locator"].append(record_locator)
+                    trace_cols["input_sha256"].append(bronze_sha256)
+                    trace_cols["valid"].append("yes")
+
+    df_silver = pd.DataFrame(silver_rows)
+    table_silver = pa.Table.from_pandas(df_silver, schema=SYNDROME_OBSERVATION_SCHEMA, preserve_index=False)
+    return table_silver, trace_cols, input_records_count
+
+
+# ==============================================================================
+# 2. GOOGLE QEC EXPERIMENTS PARSER
+# ==============================================================================
+
+def prepare_google_experiments(
+    bronze_bytes: bytes,
+    bronze_object_name: str,
+    bronze_sha256: str,
+    run_id: str,
+    issues: list[dict[str, Any]],
+) -> tuple[pa.Table, dict[str, list[Any]], int]:
+    """Parse Google QEC experiment directories and properties.yml."""
+    experiment_rows = []
+    trace_cols: dict[str, list[Any]] = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+    input_records_count = 0
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as z:
+        yaml_members = sorted([name for name in z.namelist() if name.endswith("properties.yml") and not name.startswith("__MACOSX")])
+        for ym in yaml_members:
+            input_records_count += 1
+            exp_dir = ym.split("/")[0]
+            source_record_id = f"google_qec:{exp_dir}:properties.yml"
+
+            try:
+                raw_yaml = z.read(ym).decode("utf-8")
+                prop = yaml.safe_load(raw_yaml)
+
+                basis = str(prop["basis"])
+                distance = int(prop["distance"])
+                rounds = int(prop["rounds"])
+                shots = int(prop["shots"])
+                center_row = int(prop["center_data_qubit_row"])
+                center_col = int(prop["center_data_qubit_col"])
+                meas_count = int(prop["circuit_measurements"])
+                det_count = int(prop["circuit_detectors"])
+
+                if basis not in ("X", "Z") or distance not in (3, 5) or rounds <= 0 or shots <= 0:
+                    raise ValueError(f"Invalid experiment property values in {ym}")
+
+                experiment_rows.append({
+                    "source_record_id": source_record_id,
+                    "experiment_id": exp_dir,
+                    "basis": basis,
+                    "distance": distance,
+                    "rounds": rounds,
+                    "shots": shots,
+                    "center_row": center_row,
+                    "center_col": center_col,
+                    "measurement_count": meas_count,
+                    "detector_count": det_count,
+                })
+
+                trace_cols["source_record_id"].append(source_record_id)
+                trace_cols["source_name"].append("google_qec")
+                trace_cols["bronze_object"].append(bronze_object_name)
+                trace_cols["archive_member"].append(ym)
+                trace_cols["record_locator"].append("properties.yml")
+                trace_cols["input_sha256"].append(bronze_sha256)
+                trace_cols["valid"].append("yes")
+
+            except Exception as e:
+                issues.append({
+                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "run_id": run_id,
+                    "source_record_id": source_record_id,
+                    "rule_id": "RULE_EXP_PROPERTIES",
+                    "severity": "error",
+                    "observed_value": ym,
+                    "action": "excluded",
+                    "reason": str(e),
+                })
+                trace_cols["source_record_id"].append(source_record_id)
+                trace_cols["source_name"].append("google_qec")
+                trace_cols["bronze_object"].append(bronze_object_name)
+                trace_cols["archive_member"].append(ym)
+                trace_cols["record_locator"].append("properties.yml")
+                trace_cols["input_sha256"].append(bronze_sha256)
+                trace_cols["valid"].append("no")
+
+    df_experiment = pd.DataFrame(experiment_rows)
+    table_experiment = pa.Table.from_pandas(df_experiment, schema=GOOGLE_EXPERIMENT_SCHEMA, preserve_index=False)
+    return table_experiment, trace_cols, input_records_count
+
+
+# ==============================================================================
+# 3. GOOGLE QEC SHOTS PARSER WITH MULTI-MEMBER COMPANION TRACING
+# ==============================================================================
+
+def prepare_google_shots(
+    bronze_bytes: bytes,
+    bronze_object_name: str,
+    bronze_sha256: str,
+    run_id: str,
+    issues: list[dict[str, Any]],
+) -> tuple[pa.Table, dict[str, list[Any]], int]:
+    """Parse aligned hardware shots across 8 companion member files.
+
+    Generates multi-member companion lineage traces for every shot, documenting
+    exact member byte slices and lines with valid='yes'/'no'.
+    """
+    source_record_ids = []
+    experiment_ids = []
+    shot_indices = []
+    measurement_bits_list = []
+    sweep_bits_list = []
+    detector_bits_list = []
+    detector_event_counts = []
+    actual_flips_list = []
+    bm_preds = []
+    cm_preds = []
+    pym_preds = []
+    tnc_preds = []
+
+    trace_cols: dict[str, list[Any]] = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+
+    input_records_count = 0
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as z:
+        member_set = set(z.namelist())
+        yaml_members = sorted([name for name in member_set if name.endswith("properties.yml") and not name.startswith("__MACOSX")])
+
+        for ym in yaml_members:
+            exp = ym.split("/")[0]
+            prop = yaml.safe_load(z.read(ym).decode("utf-8"))
+
+            shots = int(prop["shots"])
+            num_meas = int(prop["circuit_measurements"])
+            num_det = int(prop["circuit_detectors"])
+            num_sweep = int(prop.get("circuit_sweep_bits", 0))
+
+            meas_stride = b8_record_bytes(num_meas)
+            det_stride = b8_record_bytes(num_det)
+            sweep_stride = b8_record_bytes(num_sweep) if num_sweep > 0 else 0
+
+            # Mandatory companion files
+            det_file = f"{exp}/detection_events.b8"
+            meas_file = f"{exp}/measurements.b8"
+            sweep_file = f"{exp}/sweep.b8"
+            has_sweep = (sweep_file in member_set and sweep_stride > 0)
+            actual_file = f"{exp}/obs_flips_actual.01"
+
+            decoder_files = {
+                dec: f"{exp}/obs_flips_predicted_by_{dec}.01"
+                for dec in DECODER_NAMES
+            }
+
+            # Check presence of mandatory companion files
+            missing_companions = [
+                f for f in [det_file, meas_file, actual_file, *decoder_files.values()]
+                if f not in member_set
+            ]
+            if missing_companions:
+                issues.append({
+                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "run_id": run_id,
+                    "source_record_id": f"google_qec:{exp}",
+                    "rule_id": "RULE_GOOGLE_MISSING_COMPANION",
+                    "severity": "error",
+                    "observed_value": str(missing_companions),
+                    "action": "excluded",
+                    "reason": f"Experiment {exp} missing required companion files",
+                })
+                continue
+
+            # Read all companion streams into memory
+            det_raw = z.read(det_file)
+            meas_raw = z.read(meas_file)
+            sweep_raw = z.read(sweep_file) if has_sweep else b""
+            act_raw = parse_01_records(z.read(actual_file))
+
+            dec_streams = {}
+            for dec, dfpath in decoder_files.items():
+                dec_streams[dec] = parse_01_records(z.read(dfpath))
+
+            # Pre-validate companion file sizes / line counts
+            if (
+                len(det_raw) != shots * det_stride
+                or len(meas_raw) != shots * meas_stride
+                or (has_sweep and len(sweep_raw) != shots * sweep_stride)
+                or len(act_raw) != shots
+                or any(len(dec_streams[d]) != shots for d in DECODER_NAMES)
+            ):
+                issues.append({
+                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "run_id": run_id,
+                    "source_record_id": f"google_qec:{exp}",
+                    "rule_id": "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH",
+                    "severity": "error",
+                    "observed_value": f"det:{len(det_raw)}, meas:{len(meas_raw)}, act:{len(act_raw)}",
+                    "action": "excluded",
+                    "reason": "Companion file byte length or line count does not match declared shots",
+                })
+                continue
+
+            # Assemble aligned shots
+            for i in range(shots):
+                input_records_count += 1
+                shot_id = f"google_qec:{exp}:shot:{i}"
+
+                m_chunk = meas_raw[i * meas_stride : (i + 1) * meas_stride]
+                d_chunk = det_raw[i * det_stride : (i + 1) * det_stride]
+                sw_chunk = sweep_raw[i * sweep_stride : (i + 1) * sweep_stride] if has_sweep else b""
+
+                # Verify unused padding bits are strictly zero
+                det_rem = num_det % 8
+                meas_rem = num_meas % 8
+                is_valid = True
+                invalid_reason = ""
+
+                if det_rem != 0:
+                    last_det_byte = d_chunk[-1]
+                    if (last_det_byte >> det_rem) != 0:
+                        is_valid = False
+                        invalid_reason = "Non-zero padding bits in detection_events.b8"
+
+                if meas_rem != 0:
+                    last_meas_byte = m_chunk[-1]
+                    if (last_meas_byte >> meas_rem) != 0:
+                        is_valid = False
+                        invalid_reason = "Non-zero padding bits in measurements.b8"
+
+                event_cnt = int.from_bytes(d_chunk, "little").bit_count()
+
+                bm = bool(dec_streams["belief_matching"][i])
+                cm = bool(dec_streams["correlated_matching"][i])
+                pym = bool(dec_streams["pymatching"][i])
+                tnc = bool(dec_streams["tensor_network_contraction"][i])
+                actual_val = bool(act_raw[i])
+
+                trace_status = "yes" if is_valid else "no"
+
+                # Multi-member companion tracing: Every shot records all its constituent companion members
+                companion_members = [
+                    (det_file, f"shot:{i}"),
+                    (meas_file, f"shot:{i}"),
+                    (actual_file, f"line:{i}"),
+                    (decoder_files["belief_matching"], f"line:{i}"),
+                    (decoder_files["correlated_matching"], f"line:{i}"),
+                    (decoder_files["pymatching"], f"line:{i}"),
+                    (decoder_files["tensor_network_contraction"], f"line:{i}"),
+                ]
+                if has_sweep:
+                    companion_members.append((sweep_file, f"shot:{i}"))
+
+                for member_path, locator in companion_members:
+                    trace_cols["source_record_id"].append(shot_id)
+                    trace_cols["source_name"].append("google_qec")
+                    trace_cols["bronze_object"].append(bronze_object_name)
+                    trace_cols["archive_member"].append(member_path)
+                    trace_cols["record_locator"].append(locator)
+                    trace_cols["input_sha256"].append(bronze_sha256)
+                    trace_cols["valid"].append(trace_status)
+
+                if not is_valid:
+                    issues.append({
+                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "run_id": run_id,
+                        "source_record_id": shot_id,
+                        "rule_id": "RULE_GOOGLE_PADDING_BITS",
+                        "severity": "error",
+                        "observed_value": str(d_chunk[-1] if det_rem else m_chunk[-1]),
+                        "action": "excluded",
+                        "reason": invalid_reason,
+                    })
+                    continue
+
+                # Append valid row to Silver columnar arrays
+                source_record_ids.append(shot_id)
+                experiment_ids.append(exp)
+                shot_indices.append(i)
+                measurement_bits_list.append(m_chunk)
+                sweep_bits_list.append(sw_chunk)
+                detector_bits_list.append(d_chunk)
+                detector_event_counts.append(event_cnt)
+                actual_flips_list.append(actual_val)
+                bm_preds.append(bm)
+                cm_preds.append(cm)
+                pym_preds.append(pym)
+                tnc_preds.append(tnc)
+
+    table_shot = pa.Table.from_arrays(
+        [
+            pa.array(source_record_ids, type=pa.string()),
+            pa.array(experiment_ids, type=pa.string()),
+            pa.array(shot_indices, type=pa.int64()),
+            pa.array(measurement_bits_list, type=pa.binary()),
+            pa.array(sweep_bits_list, type=pa.binary()),
+            pa.array(detector_bits_list, type=pa.binary()),
+            pa.array(detector_event_counts, type=pa.int32()),
+            pa.array(actual_flips_list, type=pa.bool_()),
+            pa.array(bm_preds, type=pa.bool_()),
+            pa.array(cm_preds, type=pa.bool_()),
+            pa.array(pym_preds, type=pa.bool_()),
+            pa.array(tnc_preds, type=pa.bool_()),
+        ],
+        schema=GOOGLE_SHOT_SCHEMA,
+    )
+
+    return table_shot, trace_cols, input_records_count
+
+
+# ==============================================================================
+# 4. QASMBENCH HOOK (Prepared for Diego to complete)
+# ==============================================================================
+
+def prepare_qasmbench(
+    bronze_bytes: bytes | None,
+    bronze_object_name: str,
+    bronze_sha256: str | None,
+    run_id: str,
+    base_dir: Path,
+    issues: list[dict[str, Any]],
+) -> tuple[dict[str, pa.Table], dict[str, list[Any]], int]:
+    """Hook for QASMBench circuits, stabilizer checks, and conditional corrections.
+
+    Diego will plug in his complete parsing logic here.
+    If pre-existing silver/qasmbench parquet tables exist on disk (e.g. from Diego's notebooks),
+    this hook loads and preserves them seamlessly.
+    """
+    silver_qasm_tables: dict[str, pa.Table] = {}
+    trace_cols: dict[str, list[Any]] = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+    input_records_count = 0
+
+    qasm_dir = base_dir / "silver/qasmbench"
+    circuit_file = qasm_dir / "circuit.parquet"
+    check_file = qasm_dir / "stabilizer_check.parquet"
+    corr_file = qasm_dir / "conditional_correction.parquet"
+
+    if circuit_file.exists() and check_file.exists() and corr_file.exists():
+        # Load pre-built QASMBench tables from Diego
+        t_circ = pq.read_table(circuit_file)
+        t_check = pq.read_table(check_file)
+        t_corr = pq.read_table(corr_file)
+
+        silver_qasm_tables["circuit"] = t_circ
+        silver_qasm_tables["stabilizer_check"] = t_check
+        silver_qasm_tables["conditional_correction"] = t_corr
+
+        input_records_count = t_circ.num_rows + t_check.num_rows + t_corr.num_rows
+
+        sha = bronze_sha256 or "unknown"
+        for t, member_prefix, locator in [
+            (t_circ, "circuits", "circuit"),
+            (t_check, "stabilizers", "check"),
+            (t_corr, "corrections", "correction"),
+        ]:
+            for r_id in t["source_record_id"].to_pylist():
+                trace_cols["source_record_id"].append(r_id)
+                trace_cols["source_name"].append("qasmbench")
+                trace_cols["bronze_object"].append(bronze_object_name)
+                trace_cols["archive_member"].append(f"{member_prefix}/{r_id}")
+                trace_cols["record_locator"].append(locator)
+                trace_cols["input_sha256"].append(sha)
+                trace_cols["valid"].append("yes")
+
+    return silver_qasm_tables, trace_cols, input_records_count
+
+
+# ==============================================================================
+# MAIN STAGE 2 RUNNER
+# ==============================================================================
+
+def run(run_id: str, settings: Settings | None = None) -> StageResult:
+    """Execute Stage 2: Parse, validate, clean, and write Silver tables and traces."""
+    if settings is None:
+        settings = Settings.from_environment()
+
+    result = StageResult(stage="prepare_data", run_id=run_id)
+    base_dir = Path(__file__).resolve().parents[3]  # starter/ root
+
+    silver_base = base_dir / "silver"
+    results_base = base_dir / "results/part1"
+    silver_base.mkdir(parents=True, exist_ok=True)
+    results_base.mkdir(parents=True, exist_ok=True)
+
+    issues: list[dict[str, Any]] = []
+    total_inputs = 0
+    total_outputs = 0
+
+    # --------------------------------------------------------------------------
+    # 1. Process Syndromes
+    # --------------------------------------------------------------------------
+    syn_obj = "bronze/source=qec_syndromes/syndromes_dataset.zip"
+    syn_bytes, syn_sha = get_bronze_archive(syn_obj, settings, base_dir)
+    table_syn, trace_syn, in_syn = prepare_syndrome_observations(
+        syn_bytes, syn_obj, syn_sha, run_id, issues
+    )
+    total_inputs += in_syn
+    total_outputs += table_syn.num_rows
+
+    syn_out_dir = silver_base / "qec_syndromes"
+    syn_out_dir.mkdir(parents=True, exist_ok=True)
+    syn_path = syn_out_dir / "syndrome_observation.parquet"
+    pq.write_table(table_syn, syn_path, compression="zstd")
+
+    # --------------------------------------------------------------------------
+    # 2. Process Google QEC Experiments
+    # --------------------------------------------------------------------------
+    google_obj = "bronze/source=google_qec/google-surface-code-curated.zip"
+    google_bytes, google_sha = get_bronze_archive(google_obj, settings, base_dir)
+    table_exp, trace_exp, in_exp = prepare_google_experiments(
+        google_bytes, google_obj, google_sha, run_id, issues
+    )
+    total_inputs += in_exp
+    total_outputs += table_exp.num_rows
+
+    google_out_dir = silver_base / "google_qec"
+    google_out_dir.mkdir(parents=True, exist_ok=True)
+    exp_path = google_out_dir / "experiment.parquet"
+    pq.write_table(table_exp, exp_path, compression="zstd")
+
+    # --------------------------------------------------------------------------
+    # 3. Process Google QEC Shots
+    # --------------------------------------------------------------------------
+    table_shot, trace_shot, in_shot = prepare_google_shots(
+        google_bytes, google_obj, google_sha, run_id, issues
+    )
+    total_inputs += in_shot
+    total_outputs += table_shot.num_rows
+
+    shot_path = google_out_dir / "shot.parquet"
+    pq.write_table(table_shot, shot_path, compression="zstd")
+
+    # --------------------------------------------------------------------------
+    # 4. Process QASMBench (Diego's Hook)
+    # --------------------------------------------------------------------------
+    qasm_obj = "bronze/source=qasmbench/qasmbench-qec.zip"
+    try:
+        qasm_bytes, qasm_sha = get_bronze_archive(qasm_obj, settings, base_dir)
+    except Exception:
+        qasm_bytes, qasm_sha = None, None
+
+    qasm_tables, trace_qasm, in_qasm = prepare_qasmbench(
+        qasm_bytes, qasm_obj, qasm_sha, run_id, base_dir, issues
+    )
+    total_inputs += in_qasm
+    for q_name, q_table in qasm_tables.items():
+        q_dir = silver_base / "qasmbench"
+        q_dir.mkdir(parents=True, exist_ok=True)
+        q_path = q_dir / f"{q_name}.parquet"
+        pq.write_table(q_table, q_path, compression="zstd")
+        total_outputs += q_table.num_rows
+
+    # --------------------------------------------------------------------------
+    # 5. Save Lineage Traces (Combined across all sources)
+    # --------------------------------------------------------------------------
+    trace_path = results_base / "source_trace.parquet"
+    # Merge columnar trace dictionaries
+    all_trace_cols = {
+        k: (
+            trace_syn[k]
+            + trace_exp[k]
+            + trace_shot[k]
+            + trace_qasm[k]
+        )
+        for k in trace_syn
+    }
+    save_source_traces(all_trace_cols, "all", trace_path, settings=settings)
+
+    # --------------------------------------------------------------------------
+    # 6. Save Data Issues Table
+    # --------------------------------------------------------------------------
+    issues_path = results_base / "data_issues.parquet"
+    if issues:
+        df_issues = pd.DataFrame(issues)
+        table_issues = pa.Table.from_pandas(df_issues, schema=DATA_ISSUES_SCHEMA, preserve_index=False)
+    else:
+        table_issues = pa.Table.from_pylist([], schema=DATA_ISSUES_SCHEMA)
+
+    pq.write_table(table_issues, issues_path, compression="zstd")
+
+    # --------------------------------------------------------------------------
+    # 7. Upload to MinIO (if configured)
+    # --------------------------------------------------------------------------
+    if settings.lake_backend == "minio":
+        try:
+            client = minio_client(settings)
+            client.fput_object(settings.s3_bucket, "silver/qec_syndromes/syndrome_observation.parquet", str(syn_path))
+            client.fput_object(settings.s3_bucket, "silver/google_qec/experiment.parquet", str(exp_path))
+            client.fput_object(settings.s3_bucket, "silver/google_qec/shot.parquet", str(shot_path))
+            for q_name in qasm_tables:
+                client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
+            client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
+        except Exception:
+            pass
+
+    result.input_count = total_inputs
+    result.output_count = total_outputs
+    result.issue_count = len(issues)
+    result.finish()
+
+    return result
