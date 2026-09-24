@@ -20,6 +20,7 @@ from typing import Any
 import uuid
 import zipfile
 import yaml
+import re 
 
 import pandas as pd
 import pyarrow as pa
@@ -92,6 +93,35 @@ DECODER_NAMES = [
     "pymatching",
     "tensor_network_contraction",
 ]
+
+QASMBENCH_CIRCUIT_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("circuit_id", pa.string()),
+    ("benchmark_name", pa.string()),
+    ("variant", pa.string()),
+    ("register_declarations", pa.string()),
+    ("qubit_count", pa.int32()),
+    ("measurement_count", pa.int32()),
+    ("two_qubit_gate_count", pa.int32()),
+])
+
+QASMBENCH_STABILIZER_CHECK_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("circuit_id", pa.string()),
+    ("check_id", pa.string()),
+    ("ancilla_qubit", pa.string()),
+    ("data_qubits", pa.list_(pa.string())),
+    ("syndrome_bit", pa.string()),
+])
+
+QASMBENCH_CONDITIONAL_CORRECTION_SCHEMA = pa.schema([
+    ("source_record_id", pa.string()),
+    ("circuit_id", pa.string()),
+    ("condition_register", pa.string()),
+    ("condition_value", pa.int64()),
+    ("gate", pa.string()),
+    ("target_qubit", pa.string()),
+])
 
 
 # ==============================================================================
@@ -664,7 +694,7 @@ def prepare_google_shots(
 
 
 # ==============================================================================
-# 4. QASMBENCH HOOK (Prepared for Diego to complete)
+# 4. QASMBENCH HOOK 
 # ==============================================================================
 
 def prepare_qasmbench(
@@ -677,7 +707,6 @@ def prepare_qasmbench(
 ) -> tuple[dict[str, pa.Table], dict[str, list[Any]], int]:
     """Hook for QASMBench circuits, stabilizer checks, and conditional corrections.
 
-    Diego will plug in his complete parsing logic here.
     If pre-existing silver/qasmbench parquet tables exist on disk (e.g. from Diego's notebooks),
     this hook loads and preserves them seamlessly.
     """
@@ -724,8 +753,427 @@ def prepare_qasmbench(
                 trace_cols["record_locator"].append(locator)
                 trace_cols["input_sha256"].append(sha)
                 trace_cols["valid"].append("yes")
+    else: 
+        # execute if tables are not present using code from the notebooks 
 
+        # compose circuit table and traces:  
+        silver_qasm_tables['circuit'], circuit_trace_cols, circuit_records_count = _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256) 
+        _extend_trace_cols(trace_cols, circuit_trace_cols)
+        input_records_count += circuit_records_count
+
+        # compose stabilizer checks table and traces:  
+        silver_qasm_tables['stabilizer_check'], sc_trace_cols, sc_records_count = _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256)
+        _extend_trace_cols(trace_cols, sc_trace_cols)
+        input_records_count += sc_records_count
+
+        # compose conditional corrections table and traces: 
+        silver_qasm_tables['conditional_correction'], cc_trace_cols, cc_records_count = _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256)
+        _extend_trace_cols(trace_cols, cc_trace_cols)
+        input_records_count += cc_records_count
+    
     return silver_qasm_tables, trace_cols, input_records_count
+
+
+def _extend_trace_cols(target_trace_cols, incoming_trace_cols): 
+    """Helper function for extending tracer cols with incoming tracer values from a newly created table"""
+    for key in target_trace_cols: 
+        target_trace_cols[key].extend(incoming_trace_cols[key])
+
+def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256):
+    """Parse QASM circuit members into the silver circuit table and lineage traces."""
+    if bronze_bytes is None:
+        empty_table = pa.Table.from_pylist([], schema=QASMBENCH_CIRCUIT_SCHEMA)
+        empty_trace = {
+            "source_record_id": [],
+            "source_name": [],
+            "bronze_object": [],
+            "archive_member": [],
+            "record_locator": [],
+            "input_sha256": [],
+            "valid": [],
+        }
+        return empty_table, empty_trace, 0
+
+    circuit_records = []
+    trace_cols = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
+        qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
+        for member in qasm_members:
+            record = _parse_circuit(member, archive.read(member).decode("utf-8"))
+            circuit_records.append(record)
+
+            trace_cols["source_record_id"].append(record["source_record_id"])
+            trace_cols["source_name"].append("qasmbench")
+            trace_cols["bronze_object"].append(bronze_object_name)
+            trace_cols["archive_member"].append(member)
+            trace_cols["record_locator"].append("qasm_program")
+            trace_cols["input_sha256"].append(bronze_sha256)
+            trace_cols["valid"].append("yes")
+
+            print(
+                f"  {record['benchmark_name']}/{record['variant']}: "
+                f"{record['qubit_count']} qubits, {record['measurement_count']} measurements, "
+                f"{record['two_qubit_gate_count']} two-qubit gates"
+            )
+
+    table = pa.Table.from_pylist(circuit_records, schema=QASMBENCH_CIRCUIT_SCHEMA)
+    return table, trace_cols, len(circuit_records)
+
+
+def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256): 
+    """Parse QASMbench bronze objects and produce the stabilizer-check table."""
+    if bronze_bytes is None:
+        empty_table = pa.Table.from_pylist([], schema=QASMBENCH_STABILIZER_CHECK_SCHEMA)
+        empty_trace = {
+            "source_record_id": [],
+            "source_name": [],
+            "bronze_object": [],
+            "archive_member": [],
+            "record_locator": [],
+            "input_sha256": [],
+            "valid": [],
+        }
+        return empty_table, empty_trace, 0
+
+    sc_records = []
+    trace_cols = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+    input_sha256 = bronze_sha256 or "unknown"
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
+        qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
+        for member in qasm_members:
+            records = _parse_stabilizer_checks(member, archive.read(member).decode("utf-8"))
+            for rec in records:
+                sc_records.append({
+                    "source_record_id": rec["source_record_id"],
+                    "circuit_id": rec["circuit_id"],
+                    "check_id": rec["check_id"],
+                    "ancilla_qubit": rec["ancilla_qubit"],
+                    "data_qubits": rec["data_qubits"],
+                    "syndrome_bit": rec["syndrome_bit"],
+                })
+                trace_cols["source_record_id"].append(rec["source_record_id"])
+                trace_cols["source_name"].append("qasmbench")
+                trace_cols["bronze_object"].append(bronze_object_name)
+                trace_cols["archive_member"].append(member)
+                trace_cols["record_locator"].append(rec["check_id"])
+                trace_cols["input_sha256"].append(input_sha256)
+                trace_cols["valid"].append("yes")
+
+            print(f"  {Path(member).parent.name}/{Path(member).stem}: {len(records)} stabilizer checks")
+
+    table = pa.Table.from_pylist(sc_records, schema=QASMBENCH_STABILIZER_CHECK_SCHEMA)
+    return table, trace_cols, len(sc_records)
+
+
+def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256): 
+    """Parse QASMbench bronze objects and produce the conditional-correction table."""
+    if bronze_bytes is None:
+        empty_table = pa.Table.from_pylist([], schema=QASMBENCH_CONDITIONAL_CORRECTION_SCHEMA)
+        empty_trace = {
+            "source_record_id": [],
+            "source_name": [],
+            "bronze_object": [],
+            "archive_member": [],
+            "record_locator": [],
+            "input_sha256": [],
+            "valid": [],
+        }
+        return empty_table, empty_trace, 0
+
+    cc_records = []
+    trace_cols = {
+        "source_record_id": [],
+        "source_name": [],
+        "bronze_object": [],
+        "archive_member": [],
+        "record_locator": [],
+        "input_sha256": [],
+        "valid": [],
+    }
+    input_sha256 = bronze_sha256 or "unknown"
+
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
+        qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
+        for member in qasm_members:
+            records = _parse_conditional_corrections(member, archive.read(member).decode("utf-8"))
+            for rec in records:
+                cc_records.append({
+                    "source_record_id": rec["source_record_id"],
+                    "circuit_id": rec["circuit_id"],
+                    "condition_register": rec["condition_register"],
+                    "condition_value": rec["condition_value"],
+                    "gate": rec["gate"],
+                    "target_qubit": rec["target_qubit"],
+                })
+                trace_cols["source_record_id"].append(rec["source_record_id"])
+                trace_cols["source_name"].append("qasmbench")
+                trace_cols["bronze_object"].append(bronze_object_name)
+                trace_cols["archive_member"].append(rec.get("archive_member", member))
+                trace_cols["record_locator"].append(rec.get("record_locator", "statement"))
+                trace_cols["input_sha256"].append(input_sha256)
+                trace_cols["valid"].append("yes")
+
+            print(f"  {Path(member).parent.name}/{Path(member).stem}: {len(records)} conditional corrections")
+
+    table = pa.Table.from_pylist(cc_records, schema=QASMBENCH_CONDITIONAL_CORRECTION_SCHEMA)
+    return table, trace_cols, len(cc_records)
+
+
+
+# Constants for computing the QASMBench circuit table 
+
+TWO_QUBIT_GATES = {"cx", "cnot", "cz", "ch", "cy", "swap", "cu1", "crz"}
+REGISTER_DECLARATION = re.compile(r"^(qreg|creg)\s+(\w+)\s*\[\s*(\d+)\s*\]$")
+GATE_HEADER = re.compile(r"gate\s+(\w+)\s*([^{}]*)\{(?P<body>.*?)\}", re.DOTALL)
+
+# Helper functions for computing the QASMbench circuit table 
+
+def _operand_width(operand, registers):
+    match = re.fullmatch(r"(\w+)(?:\[(\d+)\])?", operand.strip())
+    assert match, f"Unsupported operand: {operand}"
+    name, index = match.groups()
+    assert name in registers, f"Unknown register: {name}"
+    return 1 if index is not None else registers[name]
+
+def _expanded_operation_count(operands, registers):
+    widths = [_operand_width(operand, registers) for operand in operands]
+    assert widths and len(set(widths)) == 1, f"Register widths do not align: {operands}"
+    return widths[0]
+
+def _body_two_qubit_count(body):
+    count = 0
+    for statement in body.split(";"):
+        tokens = statement.strip().split(None, 1)
+        if tokens and tokens[0].lower() in TWO_QUBIT_GATES:
+            count += 1
+    return count
+
+def _parse_circuit(member, text):
+    cleaned = re.sub(r"//.*", "", text)
+    gate_definitions = {}
+    for match in GATE_HEADER.finditer(cleaned):
+        gate_definitions[match.group(1)] = {
+            "formal_count": len([item for item in match.group(2).split(",") if item.strip()]),
+            "two_qubit_count": _body_two_qubit_count(match.group("body")),
+        }
+    executable_text = GATE_HEADER.sub("", cleaned)
+
+    registers = {}
+    qreg_sizes = {}
+    register_lines = []
+    measurement_count = 0
+    two_qubit_gate_count = 0
+    for statement in executable_text.replace("{", " ").replace("}", " ").split(";"):
+        statement = " ".join(statement.split())
+        if not statement or statement.startswith(("OPENQASM", "include", "barrier", "opaque")):
+            continue
+        declaration = REGISTER_DECLARATION.fullmatch(statement)
+        if declaration:
+            kind, name, size = declaration.groups()
+            registers[name] = int(size)
+            if kind == "qreg":
+                qreg_sizes[name] = int(size)
+            register_lines.append(f"{kind} {name}[{size}]")
+            continue
+        if statement.startswith("measure "):
+            left = statement[len("measure "):].split("->", 1)[0].strip()
+            measurement_count += _operand_width(left, registers)
+            continue
+        if statement.startswith("if("):
+            statement = statement.split(")", 1)[1].strip()
+        tokens = statement.split(None, 1)
+        if len(tokens) != 2:
+            continue
+        gate_name, operand_text = tokens
+        operands = [item.strip() for item in operand_text.split(",")]
+        gate_key = gate_name.lower()
+        if gate_key in TWO_QUBIT_GATES:
+            two_qubit_gate_count += _expanded_operation_count(operands, registers)
+        elif gate_name in gate_definitions:
+            widths = [_operand_width(item, registers) for item in operands]
+            assert len(widths) == gate_definitions[gate_name]["formal_count"]
+            assert len(set(widths)) == 1, f"Custom gate widths do not align: {statement}"
+            two_qubit_gate_count += gate_definitions[gate_name]["two_qubit_count"] * widths[0]
+
+    benchmark_name = Path(member).parent.name
+    filename = Path(member).stem
+    variant = "transpiled" if filename.endswith("_transpiled") else "source"
+    return {
+        "source_record_id": f"qasmbench:{member}",
+        "circuit_id": f"qasmbench:{member[:-5]}",
+        "benchmark_name": benchmark_name,
+        "variant": variant,
+        "register_declarations": "; ".join(register_lines),
+        "qubit_count": sum(qreg_sizes.values()),
+        "measurement_count": measurement_count,
+        "two_qubit_gate_count": two_qubit_gate_count,
+    }
+
+
+# Constants for Stabilizer Checks table 
+
+CNOT_STATEMENT = re.compile(r"^cx\s+([^,]+)\s*,\s*(.+)$", re.IGNORECASE)
+REGISTER_DECLARATION = re.compile(r"^(qreg|creg)\s+(\w+)\s*\[\s*(\d+)\s*\]$")
+GATE_HEADER = re.compile(r"gate\s+(\w+)\s*([^{}]*)\{(?P<body>.*?)\}", re.DOTALL)
+
+
+# Helper functions for Stabilizer Checks builder 
+
+def _normalize_operand(operand):
+    return "".join(operand.strip().split())
+
+def _parse_registers(text):
+    registers = {}
+    for statement in text.split(";"):
+        statement = " ".join(statement.split())
+        match = REGISTER_DECLARATION.fullmatch(statement)
+        if match:
+            kind, name, size = match.groups()
+            registers[name] = (kind, int(size))
+    return registers
+
+def _expand_operand(operand, registers):
+    operand = _normalize_operand(operand)
+    match = re.fullmatch(r"(\w+)(?:\[(\d+)\])?", operand)
+    assert match, f"Unsupported operand: {operand}"
+    name, index = match.groups()
+    assert name in registers, f"Unknown register: {name}"
+    kind, size = registers[name]
+    if index is not None:
+        assert int(index) < size, f"Register index out of range: {operand}"
+        return [f"{name}[{index}]"]
+    return [f"{name}[{position}]" for position in range(size)]
+
+def _expand_pairs(left, right, registers):
+    left_values = _expand_operand(left, registers)
+    right_values = _expand_operand(right, registers)
+    assert len(left_values) == len(right_values), f"CNOT registers do not align: {left}, {right}"
+    return list(zip(left_values, right_values))
+
+def _parse_stabilizer_checks(member, text):
+    cleaned = re.sub(r"//.*", "", text)
+    registers = _parse_registers(cleaned)
+    measurement_map = {}
+    for statement in cleaned.split(";"):
+        statement = " ".join(statement.split())
+        if not statement.startswith("measure "):
+            continue
+        measured, destination = [part.strip() for part in statement[len("measure "):].split("->", 1)]
+        measured_values = _expand_operand(measured, registers)
+        destination_values = _expand_operand(destination, registers)
+        assert len(measured_values) == len(destination_values)
+        measurement_map.update(zip(measured_values, destination_values))
+
+    gate_definitions = {}
+    for match in GATE_HEADER.finditer(cleaned):
+        formal_names = [item.strip() for item in match.group(2).split(",") if item.strip()]
+        body_pairs = []
+        for statement in match.group("body").split(";"):
+            statement = " ".join(statement.split())
+            body_match = CNOT_STATEMENT.fullmatch(statement)
+            if body_match:
+                body_pairs.append((body_match.group(1).strip(), body_match.group(2).strip()))
+        gate_definitions[match.group(1)] = (formal_names, body_pairs)
+
+    executable_text = GATE_HEADER.sub("", cleaned)
+    interactions = []
+    for statement in executable_text.split(";"):
+        statement = " ".join(statement.split())
+        if not statement or statement.startswith(("OPENQASM", "include", "barrier", "opaque", "measure", "qreg", "creg")):
+            continue
+        tokens = statement.split(None, 1)
+        if len(tokens) != 2:
+            continue
+        operation, operand_text = tokens
+        if operation.lower() == "cx":
+            left, right = [part.strip() for part in operand_text.split(",", 1)]
+            interactions.extend(_expand_pairs(left, right, registers))
+        elif operation in gate_definitions:
+            formal_names, body_pairs = gate_definitions[operation]
+            actual_operands = [part.strip() for part in operand_text.split(",")]
+            assert len(formal_names) == len(actual_operands), f"Custom gate arguments do not align: {statement}"
+            substitutions = dict(zip(formal_names, actual_operands))
+            for left, right in body_pairs:
+                mapped_left = substitutions[left]
+                mapped_right = substitutions[right]
+                interactions.extend(_expand_pairs(mapped_left, mapped_right, registers))
+
+    by_ancilla = {}
+    for data_qubit, ancilla_qubit in interactions:
+        by_ancilla.setdefault(ancilla_qubit, set()).add(data_qubit)
+
+    benchmark_name = Path(member).parent.name
+    variant = "transpiled" if Path(member).stem.endswith("_transpiled") else "source"
+    circuit_id = f"qasmbench:{member[:-5]}"
+    records = []
+    for check_number, ancilla_qubit in enumerate(sorted(by_ancilla)):
+        data_qubits = sorted(by_ancilla[ancilla_qubit])
+        syndrome_bit = measurement_map.get(ancilla_qubit)
+        if len(data_qubits) < 2 or syndrome_bit is None:
+            continue
+        check_id = f"{circuit_id}:check:{check_number}"
+        records.append({
+            "source_record_id": f"qasmbench:{member}:check:{check_number}",
+            "circuit_id": circuit_id,
+            "check_id": check_id,
+            "ancilla_qubit": ancilla_qubit,
+            "data_qubits": data_qubits,
+            "syndrome_bit": syndrome_bit,
+        })
+    return records
+
+# Constants for Conditional Corrections 
+
+CONDITIONAL_CORRECTION = re.compile(
+    r"^if\s*\(\s*([A-Za-z_]\w*)\s*==\s*(-?\d+)\s*\)\s*([A-Za-z_]\w*)\s+([^;]+)$",
+    re.IGNORECASE,
+)
+
+# Helper function for creating Conditional Corrections 
+
+def _parse_conditional_corrections(member, text):
+    cleaned = re.sub(r"//.*", "", text)
+    circuit_id = f"qasmbench:{member[:-5]}"
+    records = []
+    for statement_index, statement in enumerate(cleaned.split(";")):
+        statement = " ".join(statement.split())
+        if not statement:
+            continue
+        match = CONDITIONAL_CORRECTION.fullmatch(statement)
+        if not match:
+            continue
+        condition_register, condition_value, gate, target_qubit = match.groups()
+        records.append({
+            "source_record_id": f"qasmbench:{member}:statement:{statement_index}",
+            "circuit_id": circuit_id,
+            "condition_register": condition_register,
+            "condition_value": int(condition_value),
+            "gate": gate,
+            "target_qubit": "".join(target_qubit.split()),
+            "archive_member": member,
+            "record_locator": f"statement:{statement_index}",
+        })
+    return records
+
+
 
 
 # ==============================================================================
@@ -794,7 +1242,7 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     pq.write_table(table_shot, shot_path, compression="zstd")
 
     # --------------------------------------------------------------------------
-    # 4. Process QASMBench (Diego's Hook)
+    # 4. Process QASMBench 
     # --------------------------------------------------------------------------
     qasm_obj = "bronze/source=qasmbench/qasmbench-qec.zip"
     try:

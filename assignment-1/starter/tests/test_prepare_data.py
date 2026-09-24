@@ -59,7 +59,62 @@ def test_prepare_data_stage_execution():
     assert df_shot.isna().sum().sum() == 0
     assert (df_shot["detector_event_count"] >= 0).all()
 
-    # 4. Source trace contract, valid column, and companion-file coverage
+    # 4. QASMBench silver-table contract
+    qasm_dir = silver_dir / "qasmbench"
+    qasm_specs = {
+        "circuit": [
+            "source_record_id",
+            "circuit_id",
+            "benchmark_name",
+            "variant",
+            "register_declarations",
+            "qubit_count",
+            "measurement_count",
+            "two_qubit_gate_count",
+        ],
+        "stabilizer_check": [
+            "source_record_id",
+            "circuit_id",
+            "check_id",
+            "ancilla_qubit",
+            "data_qubits",
+            "syndrome_bit",
+        ],
+        "conditional_correction": [
+            "source_record_id",
+            "circuit_id",
+            "condition_register",
+            "condition_value",
+            "gate",
+            "target_qubit",
+        ],
+    }
+    for table_name, expected_columns in qasm_specs.items():
+        table_path = qasm_dir / f"{table_name}.parquet"
+        assert table_path.exists(), f"QASMBench {table_name} Silver table missing"
+        t_qasm = pq.read_table(table_path)
+        assert set(t_qasm.column_names) == set(expected_columns)
+        assert t_qasm.num_rows > 0
+
+    t_qasm_circuit = pq.read_table(qasm_dir / "circuit.parquet")
+    df_qasm_circuit = t_qasm_circuit.to_pandas()
+    assert df_qasm_circuit["source_record_id"].is_unique
+    assert (df_qasm_circuit["qubit_count"] > 0).all()
+    assert (df_qasm_circuit["measurement_count"] > 0).all()
+    assert (df_qasm_circuit["two_qubit_gate_count"] >= 0).all()
+
+    t_qasm_checks = pq.read_table(qasm_dir / "stabilizer_check.parquet")
+    df_qasm_checks = t_qasm_checks.to_pandas()
+    assert df_qasm_checks["source_record_id"].is_unique
+    assert (df_qasm_checks["syndrome_bit"].str.len() > 0).all()
+
+    t_qasm_corr = pq.read_table(qasm_dir / "conditional_correction.parquet")
+    df_qasm_corr = t_qasm_corr.to_pandas()
+    assert df_qasm_corr["source_record_id"].is_unique
+    assert (df_qasm_corr["condition_value"].astype(int) >= 0).all()
+    assert set(df_qasm_corr["gate"]).issubset({"cx", "cz", "swap", "x", "y", "z"})
+
+    # 5. Source trace contract, valid column, and companion-file coverage
     trace_file = results_dir / "source_trace.parquet"
     assert trace_file.exists(), "source_trace.parquet missing"
     t_trace = pq.read_table(trace_file)
