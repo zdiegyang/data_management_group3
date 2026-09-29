@@ -722,54 +722,23 @@ def prepare_qasmbench(
     }
     input_records_count = 0
 
-    qasm_dir = base_dir / "silver/qasmbench"
-    circuit_file = qasm_dir / "circuit.parquet"
-    check_file = qasm_dir / "stabilizer_check.parquet"
-    corr_file = qasm_dir / "conditional_correction.parquet"
+    
+    # execute if tables are not present using code from the notebooks 
 
-    if circuit_file.exists() and check_file.exists() and corr_file.exists():
-        # Load pre-built QASMBench tables from Diego
-        t_circ = pq.read_table(circuit_file)
-        t_check = pq.read_table(check_file)
-        t_corr = pq.read_table(corr_file)
+    # compose circuit table and traces:  
+    silver_qasm_tables['circuit'], circuit_trace_cols, circuit_records_count = _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256) 
+    _extend_trace_cols(trace_cols, circuit_trace_cols)
+    input_records_count += circuit_records_count
 
-        silver_qasm_tables["circuit"] = t_circ
-        silver_qasm_tables["stabilizer_check"] = t_check
-        silver_qasm_tables["conditional_correction"] = t_corr
+    # compose stabilizer checks table and traces:  
+    silver_qasm_tables['stabilizer_check'], sc_trace_cols, sc_records_count = _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256)
+    _extend_trace_cols(trace_cols, sc_trace_cols)
+    input_records_count += sc_records_count
 
-        input_records_count = t_circ.num_rows + t_check.num_rows + t_corr.num_rows
-
-        sha = bronze_sha256 or "unknown"
-        for t, member_prefix, locator in [
-            (t_circ, "circuits", "circuit"),
-            (t_check, "stabilizers", "check"),
-            (t_corr, "corrections", "correction"),
-        ]:
-            for r_id in t["source_record_id"].to_pylist():
-                trace_cols["source_record_id"].append(r_id)
-                trace_cols["source_name"].append("qasmbench")
-                trace_cols["bronze_object"].append(bronze_object_name)
-                trace_cols["archive_member"].append(f"{member_prefix}/{r_id}")
-                trace_cols["record_locator"].append(locator)
-                trace_cols["input_sha256"].append(sha)
-                trace_cols["valid"].append("yes")
-    else: 
-        # execute if tables are not present using code from the notebooks 
-
-        # compose circuit table and traces:  
-        silver_qasm_tables['circuit'], circuit_trace_cols, circuit_records_count = _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256) 
-        _extend_trace_cols(trace_cols, circuit_trace_cols)
-        input_records_count += circuit_records_count
-
-        # compose stabilizer checks table and traces:  
-        silver_qasm_tables['stabilizer_check'], sc_trace_cols, sc_records_count = _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256)
-        _extend_trace_cols(trace_cols, sc_trace_cols)
-        input_records_count += sc_records_count
-
-        # compose conditional corrections table and traces: 
-        silver_qasm_tables['conditional_correction'], cc_trace_cols, cc_records_count = _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256)
-        _extend_trace_cols(trace_cols, cc_trace_cols)
-        input_records_count += cc_records_count
+    # compose conditional corrections table and traces: 
+    silver_qasm_tables['conditional_correction'], cc_trace_cols, cc_records_count = _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256)
+    _extend_trace_cols(trace_cols, cc_trace_cols)
+    input_records_count += cc_records_count
     
     return silver_qasm_tables, trace_cols, input_records_count
 
