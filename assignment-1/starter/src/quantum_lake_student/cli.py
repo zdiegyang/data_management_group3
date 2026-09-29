@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import sys
 
+from datetime import UTC, datetime
+
 from rich.console import Console
 from rich.table import Table
 
 from .config import Settings
 from .connections import bronze_inventory, check_platform
+from .stages import prepare_data
 
 
 console = Console()
@@ -32,13 +35,25 @@ def command_inventory(settings: Settings) -> int:
     return 0
 
 
-def command_run(_: Settings) -> int:
-    console.print(
-        "[yellow]Pipeline stages are intentionally unimplemented.[/yellow]\n"
-        "Implement your pipeline modules under src/quantum_lake_student, then "
-        "replace this command with your orchestrated Part I runner."
+def command_run(settings: Settings) -> int:
+    run_id = f"run_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    console.print(f"[bold blue]Starting Part I Pipeline (Run ID: {run_id})...[/bold blue]")
+
+    # Stage 2: Data Preparation & Silver
+    res_prep = prepare_data.run(run_id=run_id, settings=settings)
+    duration = (
+        (res_prep.finished_at - res_prep.started_at).total_seconds()
+        if res_prep.finished_at
+        else 0.0
     )
-    return 2
+    console.print(
+        f"[green]✓ Stage 2 (prepare_data):[/green] "
+        f"{res_prep.input_count:,} inputs -> {res_prep.output_count:,} outputs "
+        f"({res_prep.issue_count} issues) in {duration:.2f}s"
+    )
+
+    console.print("[bold green]✓ Part I Data Preparation completed successfully![/bold green]")
+    return 0
 
 
 def command_train(_: Settings) -> int:
