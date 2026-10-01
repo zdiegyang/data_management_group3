@@ -256,7 +256,7 @@ def load_gold(conn: psycopg.Connection, lake: Lake) -> None:
     gexp = lake.get_table(G_EXP_SILVER).to_pylist()[0]
     gshot = lake.get_table(G_SHOT_SILVER).to_pylist()[0]
     with conn.transaction():                               # all-or-nothing
-        conn.execute((SQL / "gold_slice.sql").read_text())
+        conn.execute((SQL / "gold_schema.sql").read_text())
         conn.execute("INSERT INTO gold.sim_experiment VALUES (%s,%s,3) ON CONFLICT DO NOTHING",
                      (syn["experiment_id"], syn["physical_fault_rate"]))
         conn.execute("INSERT INTO gold.syndrome_observation VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
