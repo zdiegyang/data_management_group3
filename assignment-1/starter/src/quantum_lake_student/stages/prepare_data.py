@@ -15,9 +15,12 @@ import ast
 import csv
 import hashlib
 import io
+import json
+import logging
 from pathlib import Path
+import subprocess
+import traceback
 from typing import Any
-import uuid
 import zipfile
 import yaml
 import re 
@@ -29,7 +32,7 @@ import pyarrow.parquet as pq
 from quantum_lake_student.config import Settings
 from quantum_lake_student.connections import minio_client
 from quantum_lake_student.formats import b8_record_bytes, parse_01_records
-from quantum_lake_student.models import StageResult
+from quantum_lake_student.models import StageResult, stable_record_hash
 from quantum_lake_student.tracing import SOURCE_TRACE_SCHEMA, save_source_traces
 
 
@@ -86,6 +89,164 @@ DATA_ISSUES_SCHEMA = pa.schema([
     ("action", pa.string()),
     ("reason", pa.string()),
 ])
+
+
+def _stable_issue_id(source_record_id: str, rule_id: str, observed_value: str) -> str:
+    return f"issue_{stable_record_hash({
+        'source_record_id': source_record_id,
+        'rule_id': rule_id,
+        'observed_value': observed_value,
+    })}"
+
+
+def _append_qasm_issue(
+    issues: list[dict[str, Any]],
+    run_id: str,
+    source_record_id: str,
+    rule_id: str,
+    observed_value: str,
+    reason: str,
+) -> None:
+    issues.append({
+        "issue_id": _stable_issue_id(source_record_id, rule_id, observed_value),
+        "run_id": run_id,
+        "source_record_id": source_record_id,
+        "rule_id": rule_id,
+        "severity": "error",
+        "observed_value": observed_value,
+        "action": "excluded",
+        "reason": reason,
+    })
+
+
+def _row_counts(
+    rows_read: int,
+    rows_accepted: int,
+    rows_loaded: int,
+    unit: str,
+) -> dict[str, int | str]:
+    rows_rejected = rows_read - rows_accepted
+    if rows_rejected < 0:
+        raise ValueError("Accepted row count cannot exceed rows read")
+    return {
+        "unit": unit,
+        "rows_read": rows_read,
+        "rows_accepted": rows_accepted,
+        "rows_rejected": rows_rejected,
+        "rows_loaded": rows_loaded,
+    }
+
+
+def _git_revision(base_dir: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=base_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as output_file:
+        json.dump(value, output_file, indent=2, sort_keys=True)
+        output_file.write("\n")
+
+
+def _remember_table(
+    run_state: dict[str, Any],
+    table_path: str,
+    counts: dict[str, int | str],
+) -> None:
+    run_state["row_counts"][table_path] = counts
+    run_state["output_table_counts"][table_path] = counts["rows_loaded"]
+
+
+def _record_failed_run(
+    run_id: str,
+    result: StageResult | None,
+    run_state: dict[str, Any],
+    error: Exception,
+) -> None:
+    base_dir = run_state["base_dir"]
+    if result is None:
+        result = StageResult(stage="prepare_data", run_id=run_id)
+    results_base = base_dir / "results/part1"
+    results_base.mkdir(parents=True, exist_ok=True)
+    result.finish()
+
+    error_message = str(error)
+    issues = run_state.setdefault("issues", [])
+    issues.append({
+        "issue_id": _stable_issue_id(
+            "prepare_data", "RUN_PREPARE_DATA_FAILED", error_message
+        ),
+        "run_id": run_id,
+        "source_record_id": None,
+        "rule_id": "RUN_PREPARE_DATA_FAILED",
+        "severity": "error",
+        "observed_value": f"{type(error).__name__}: {error_message}",
+        "action": "aborted",
+        "reason": error_message,
+    })
+
+    row_counts = run_state.setdefault("row_counts", {})
+    output_table_counts = run_state.setdefault("output_table_counts", {})
+    issues_path = results_base / "data_issues.parquet"
+    try:
+        issue_table = pa.Table.from_pandas(
+            pd.DataFrame(issues),
+            schema=DATA_ISSUES_SCHEMA,
+            preserve_index=False,
+        )
+        pq.write_table(issue_table, issues_path, compression="zstd")
+        _remember_table(
+            run_state,
+            "results/part1/data_issues.parquet",
+            _row_counts(len(issues), len(issues), issue_table.num_rows, "issue finding"),
+        )
+    except Exception:
+        logging.exception("Could not persist data issues for failed run %s", run_id)
+
+    result.issue_count = len(issues)
+    result.finish()
+    row_counts_path = results_base / "row_counts.json"
+    run_path = results_base / "run.json"
+    try:
+        _write_json(row_counts_path, {"run_id": run_id, "tables": row_counts})
+        _write_json(run_path, {
+            "run_id": run_id,
+            "stage": "prepare_data",
+            "status": "failed",
+            "input_hashes": run_state.get("input_hashes", {}),
+            "git_revision": _git_revision(base_dir),
+            "started_at": result.started_at.isoformat(),
+            "ended_at": result.finished_at.isoformat(),
+            "issue_count": result.issue_count,
+            "output_table_counts": output_table_counts,
+            "error": {
+                "type": type(error).__name__,
+                "message": error_message,
+                "traceback": "".join(traceback.format_exception(error)),
+            },
+        })
+    except Exception:
+        logging.exception("Could not persist failed run metadata for %s", run_id)
+
+    settings = run_state.get("settings")
+    if settings and settings.lake_backend == "minio":
+        try:
+            client = minio_client(settings)
+            client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
+            client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
+            client.fput_object(settings.s3_bucket, "results/part1/run.json", str(run_path))
+        except Exception:
+            logging.exception("Could not upload failed run metadata for %s", run_id)
 
 DECODER_NAMES = [
     "belief_matching",
@@ -204,7 +365,9 @@ def prepare_syndrome_observations(
                 pfr = float(pfr_str)
             except Exception as e:
                 issues.append({
-                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "issue_id": _stable_issue_id(
+                        f"qec_syndromes:{member}", "RULE_SYN_FILENAME_PFR", member
+                    ),
                     "run_id": run_id,
                     "source_record_id": f"qec_syndromes:{member}",
                     "rule_id": "RULE_SYN_FILENAME_PFR",
@@ -223,7 +386,9 @@ def prepare_syndrome_observations(
                     header = next(reader)
                 except StopIteration:
                     issues.append({
-                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "issue_id": _stable_issue_id(
+                            f"qec_syndromes:{member}", "RULE_SYN_EMPTY_FILE", member
+                        ),
                         "run_id": run_id,
                         "source_record_id": f"qec_syndromes:{member}",
                         "rule_id": "RULE_SYN_EMPTY_FILE",
@@ -236,7 +401,11 @@ def prepare_syndrome_observations(
 
                 if header not in (["labels", "syndromes", "quantity"], ["label", "syndromes", "quantity"]):
                     issues.append({
-                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "issue_id": _stable_issue_id(
+                            f"qec_syndromes:{member}:header",
+                            "RULE_SYN_HEADER",
+                            str(header),
+                        ),
                         "run_id": run_id,
                         "source_record_id": f"qec_syndromes:{member}:header",
                         "rule_id": "RULE_SYN_HEADER",
@@ -253,7 +422,9 @@ def prepare_syndrome_observations(
 
                     if len(row) != 3:
                         issues.append({
-                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "issue_id": _stable_issue_id(
+                                source_record_id, "RULE_SYN_ROW_LEN", str(row)
+                            ),
                             "run_id": run_id,
                             "source_record_id": source_record_id,
                             "rule_id": "RULE_SYN_ROW_LEN",
@@ -279,7 +450,9 @@ def prepare_syndrome_observations(
                         logical_error_label = bool(label_val)
                     except Exception as e:
                         issues.append({
-                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "issue_id": _stable_issue_id(
+                                source_record_id, "RULE_SYN_LABEL_DOMAIN", row[0]
+                            ),
                             "run_id": run_id,
                             "source_record_id": source_record_id,
                             "rule_id": "RULE_SYN_LABEL_DOMAIN",
@@ -308,7 +481,9 @@ def prepare_syndrome_observations(
                         syndrome_bytes = bytes(flat_bits)
                     except Exception as e:
                         issues.append({
-                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "issue_id": _stable_issue_id(
+                                source_record_id, "RULE_SYN_SHAPE_DOMAIN", row[1]
+                            ),
                             "run_id": run_id,
                             "source_record_id": source_record_id,
                             "rule_id": "RULE_SYN_SHAPE_DOMAIN",
@@ -333,7 +508,9 @@ def prepare_syndrome_observations(
                             raise ValueError("Quantity must be greater than zero")
                     except Exception as e:
                         issues.append({
-                            "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                            "issue_id": _stable_issue_id(
+                                source_record_id, "RULE_SYN_QUANTITY_POSITIVE", row[2]
+                            ),
                             "run_id": run_id,
                             "source_record_id": source_record_id,
                             "rule_id": "RULE_SYN_QUANTITY_POSITIVE",
@@ -446,7 +623,9 @@ def prepare_google_experiments(
 
             except Exception as e:
                 issues.append({
-                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "issue_id": _stable_issue_id(
+                        source_record_id, "RULE_EXP_PROPERTIES", ym
+                    ),
                     "run_id": run_id,
                     "source_record_id": source_record_id,
                     "rule_id": "RULE_EXP_PROPERTIES",
@@ -521,6 +700,7 @@ def prepare_google_shots(
             num_meas = int(prop["circuit_measurements"])
             num_det = int(prop["circuit_detectors"])
             num_sweep = int(prop.get("circuit_sweep_bits", 0))
+            input_records_count += shots
 
             meas_stride = b8_record_bytes(num_meas)
             det_stride = b8_record_bytes(num_det)
@@ -545,7 +725,11 @@ def prepare_google_shots(
             ]
             if missing_companions:
                 issues.append({
-                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "issue_id": _stable_issue_id(
+                        f"google_qec:{exp}",
+                        "RULE_GOOGLE_MISSING_COMPANION",
+                        str(missing_companions),
+                    ),
                     "run_id": run_id,
                     "source_record_id": f"google_qec:{exp}",
                     "rule_id": "RULE_GOOGLE_MISSING_COMPANION",
@@ -575,7 +759,11 @@ def prepare_google_shots(
                 or any(len(dec_streams[d]) != shots for d in DECODER_NAMES)
             ):
                 issues.append({
-                    "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                    "issue_id": _stable_issue_id(
+                        f"google_qec:{exp}",
+                        "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH",
+                        f"det:{len(det_raw)}, meas:{len(meas_raw)}, act:{len(act_raw)}",
+                    ),
                     "run_id": run_id,
                     "source_record_id": f"google_qec:{exp}",
                     "rule_id": "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH",
@@ -588,7 +776,6 @@ def prepare_google_shots(
 
             # Assemble aligned shots
             for i in range(shots):
-                input_records_count += 1
                 shot_id = f"google_qec:{exp}:shot:{i}"
 
                 m_chunk = meas_raw[i * meas_stride : (i + 1) * meas_stride]
@@ -647,7 +834,11 @@ def prepare_google_shots(
 
                 if not is_valid:
                     issues.append({
-                        "issue_id": f"issue_{uuid.uuid4().hex[:12]}",
+                        "issue_id": _stable_issue_id(
+                            shot_id,
+                            "RULE_GOOGLE_PADDING_BITS",
+                            str(d_chunk[-1] if det_rem else m_chunk[-1]),
+                        ),
                         "run_id": run_id,
                         "source_record_id": shot_id,
                         "rule_id": "RULE_GOOGLE_PADDING_BITS",
@@ -704,7 +895,7 @@ def prepare_qasmbench(
     run_id: str,
     base_dir: Path,
     issues: list[dict[str, Any]],
-) -> tuple[dict[str, pa.Table], dict[str, list[Any]], int]:
+) -> tuple[dict[str, pa.Table], dict[str, list[Any]], dict[str, dict[str, int | str]]]:
     """Hook for QASMBench circuits, stabilizer checks, and conditional corrections.
 
     If pre-existing silver/qasmbench parquet tables exist on disk (e.g. from Diego's notebooks),
@@ -720,27 +911,42 @@ def prepare_qasmbench(
         "input_sha256": [],
         "valid": [],
     }
-    input_records_count = 0
-
-    
     # execute if tables are not present using code from the notebooks 
 
     # compose circuit table and traces:  
-    silver_qasm_tables['circuit'], circuit_trace_cols, circuit_records_count = _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256) 
+    silver_qasm_tables['circuit'], circuit_trace_cols, circuit_rows_read, circuit_rows_rejected = _create_qasmbench_circuit_table(
+        bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues
+    )
     _extend_trace_cols(trace_cols, circuit_trace_cols)
-    input_records_count += circuit_records_count
 
     # compose stabilizer checks table and traces:  
-    silver_qasm_tables['stabilizer_check'], sc_trace_cols, sc_records_count = _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256)
+    silver_qasm_tables['stabilizer_check'], sc_trace_cols, sc_rows_read, sc_rows_rejected = _create_qasmbench_stabilizer_checks_table(
+        bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues
+    )
     _extend_trace_cols(trace_cols, sc_trace_cols)
-    input_records_count += sc_records_count
 
     # compose conditional corrections table and traces: 
-    silver_qasm_tables['conditional_correction'], cc_trace_cols, cc_records_count = _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256)
+    silver_qasm_tables['conditional_correction'], cc_trace_cols, cc_rows_read, cc_rows_rejected = _create_qasmbench_conditional_correction_table(
+        bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues
+    )
     _extend_trace_cols(trace_cols, cc_trace_cols)
-    input_records_count += cc_records_count
+
+    source_counts = {
+        "circuit": (circuit_rows_read, circuit_rows_rejected),
+        "stabilizer_check": (sc_rows_read, sc_rows_rejected),
+        "conditional_correction": (cc_rows_read, cc_rows_rejected),
+    }
+    row_counts = {
+        name: _row_counts(
+            rows_read,
+            rows_read - rows_rejected,
+            silver_qasm_tables[name].num_rows,
+            "QASM archive member",
+        )
+        for name, (rows_read, rows_rejected) in source_counts.items()
+    }
     
-    return silver_qasm_tables, trace_cols, input_records_count
+    return silver_qasm_tables, trace_cols, row_counts
 
 
 def _extend_trace_cols(target_trace_cols, incoming_trace_cols): 
@@ -748,7 +954,7 @@ def _extend_trace_cols(target_trace_cols, incoming_trace_cols):
     for key in target_trace_cols: 
         target_trace_cols[key].extend(incoming_trace_cols[key])
 
-def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256):
+def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues):
     """Parse QASM circuit members into the silver circuit table and lineage traces."""
     if bronze_bytes is None:
         empty_table = pa.Table.from_pylist([], schema=QASMBENCH_CIRCUIT_SCHEMA)
@@ -761,9 +967,11 @@ def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha
             "input_sha256": [],
             "valid": [],
         }
-        return empty_table, empty_trace, 0
+        return empty_table, empty_trace, 0, 0
 
     circuit_records = []
+    rows_read = 0
+    rows_rejected = 0
     trace_cols = {
         "source_record_id": [],
         "source_name": [],
@@ -777,7 +985,20 @@ def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha
     with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
         qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
         for member in qasm_members:
-            record = _parse_circuit(member, archive.read(member).decode("utf-8"))
+            rows_read += 1
+            try:
+                record = _parse_circuit(member, archive.read(member).decode("utf-8"))
+            except Exception as exc:
+                rows_rejected += 1
+                _append_qasm_issue(
+                    issues,
+                    run_id,
+                    f"qasmbench:{member}",
+                    "RULE_QASM_CIRCUIT_PARSE",
+                    member,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                continue
             circuit_records.append(record)
 
             trace_cols["source_record_id"].append(record["source_record_id"])
@@ -795,10 +1016,10 @@ def _create_qasmbench_circuit_table(bronze_bytes, bronze_object_name, bronze_sha
             )
 
     table = pa.Table.from_pylist(circuit_records, schema=QASMBENCH_CIRCUIT_SCHEMA)
-    return table, trace_cols, len(circuit_records)
+    return table, trace_cols, rows_read, rows_rejected
 
 
-def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256): 
+def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues): 
     """Parse QASMbench bronze objects and produce the stabilizer-check table."""
     if bronze_bytes is None:
         empty_table = pa.Table.from_pylist([], schema=QASMBENCH_STABILIZER_CHECK_SCHEMA)
@@ -811,9 +1032,11 @@ def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, 
             "input_sha256": [],
             "valid": [],
         }
-        return empty_table, empty_trace, 0
+        return empty_table, empty_trace, 0, 0
 
     sc_records = []
+    rows_read = 0
+    rows_rejected = 0
     trace_cols = {
         "source_record_id": [],
         "source_name": [],
@@ -828,7 +1051,20 @@ def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, 
     with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
         qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
         for member in qasm_members:
-            records = _parse_stabilizer_checks(member, archive.read(member).decode("utf-8"))
+            rows_read += 1
+            try:
+                records = _parse_stabilizer_checks(member, archive.read(member).decode("utf-8"))
+            except Exception as exc:
+                rows_rejected += 1
+                _append_qasm_issue(
+                    issues,
+                    run_id,
+                    f"qasmbench:{member}",
+                    "RULE_QASM_STABILIZER_PARSE",
+                    member,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                continue
             for rec in records:
                 sc_records.append({
                     "source_record_id": rec["source_record_id"],
@@ -849,10 +1085,10 @@ def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, 
             print(f"  {Path(member).parent.name}/{Path(member).stem}: {len(records)} stabilizer checks")
 
     table = pa.Table.from_pylist(sc_records, schema=QASMBENCH_STABILIZER_CHECK_SCHEMA)
-    return table, trace_cols, len(sc_records)
+    return table, trace_cols, rows_read, rows_rejected
 
 
-def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256): 
+def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_name, bronze_sha256, run_id, issues): 
     """Parse QASMbench bronze objects and produce the conditional-correction table."""
     if bronze_bytes is None:
         empty_table = pa.Table.from_pylist([], schema=QASMBENCH_CONDITIONAL_CORRECTION_SCHEMA)
@@ -865,9 +1101,11 @@ def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_n
             "input_sha256": [],
             "valid": [],
         }
-        return empty_table, empty_trace, 0
+        return empty_table, empty_trace, 0, 0
 
     cc_records = []
+    rows_read = 0
+    rows_rejected = 0
     trace_cols = {
         "source_record_id": [],
         "source_name": [],
@@ -882,7 +1120,20 @@ def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_n
     with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
         qasm_members = sorted(name for name in archive.namelist() if name.endswith(".qasm"))
         for member in qasm_members:
-            records = _parse_conditional_corrections(member, archive.read(member).decode("utf-8"))
+            rows_read += 1
+            try:
+                records = _parse_conditional_corrections(member, archive.read(member).decode("utf-8"))
+            except Exception as exc:
+                rows_rejected += 1
+                _append_qasm_issue(
+                    issues,
+                    run_id,
+                    f"qasmbench:{member}",
+                    "RULE_QASM_CORRECTION_PARSE",
+                    member,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                continue
             for rec in records:
                 cc_records.append({
                     "source_record_id": rec["source_record_id"],
@@ -903,7 +1154,7 @@ def _create_qasmbench_conditional_correction_table(bronze_bytes, bronze_object_n
             print(f"  {Path(member).parent.name}/{Path(member).stem}: {len(records)} conditional corrections")
 
     table = pa.Table.from_pylist(cc_records, schema=QASMBENCH_CONDITIONAL_CORRECTION_SCHEMA)
-    return table, trace_cols, len(cc_records)
+    return table, trace_cols, rows_read, rows_rejected
 
 
 
@@ -1150,12 +1401,35 @@ def _parse_conditional_corrections(member, text):
 # ==============================================================================
 
 def run(run_id: str, settings: Settings | None = None) -> StageResult:
+    run_state: dict[str, Any] = {
+        "base_dir": Path(__file__).resolve().parents[3],
+        "input_hashes": {},
+        "row_counts": {},
+        "output_table_counts": {},
+    }
+    try:
+        return _execute_run(run_id, settings, run_state)
+    except Exception as exc:
+        try:
+            _record_failed_run(run_id, run_state.get("result"), run_state, exc)
+        except Exception:
+            logging.exception("Could not record failed prepare_data run %s", run_id)
+        raise
+
+
+def _execute_run(
+    run_id: str,
+    settings: Settings | None,
+    run_state: dict[str, Any],
+) -> StageResult:
     """Execute Stage 2: Parse, validate, clean, and write Silver tables and traces."""
     if settings is None:
         settings = Settings.from_environment()
 
     result = StageResult(stage="prepare_data", run_id=run_id)
     base_dir = Path(__file__).resolve().parents[3]  # starter/ root
+    run_state["result"] = result
+    run_state["settings"] = settings
 
     silver_base = base_dir / "silver"
     results_base = base_dir / "results/part1"
@@ -1163,6 +1437,7 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     results_base.mkdir(parents=True, exist_ok=True)
 
     issues: list[dict[str, Any]] = []
+    run_state["issues"] = issues
     total_inputs = 0
     total_outputs = 0
 
@@ -1171,6 +1446,7 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     # --------------------------------------------------------------------------
     syn_obj = "bronze/source=qec_syndromes/syndromes_dataset.zip"
     syn_bytes, syn_sha = get_bronze_archive(syn_obj, settings, base_dir)
+    run_state["input_hashes"][syn_obj] = syn_sha
     table_syn, trace_syn, in_syn = prepare_syndrome_observations(
         syn_bytes, syn_obj, syn_sha, run_id, issues
     )
@@ -1181,12 +1457,18 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     syn_out_dir.mkdir(parents=True, exist_ok=True)
     syn_path = syn_out_dir / "syndrome_observation.parquet"
     pq.write_table(table_syn, syn_path, compression="zstd")
+    _remember_table(
+        run_state,
+        "silver/qec_syndromes/syndrome_observation.parquet",
+        _row_counts(in_syn, table_syn.num_rows, table_syn.num_rows, "CSV data row"),
+    )
 
     # --------------------------------------------------------------------------
     # 2. Process Google QEC Experiments
     # --------------------------------------------------------------------------
     google_obj = "bronze/source=google_qec/google-surface-code-curated.zip"
     google_bytes, google_sha = get_bronze_archive(google_obj, settings, base_dir)
+    run_state["input_hashes"][google_obj] = google_sha
     table_exp, trace_exp, in_exp = prepare_google_experiments(
         google_bytes, google_obj, google_sha, run_id, issues
     )
@@ -1197,6 +1479,11 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     google_out_dir.mkdir(parents=True, exist_ok=True)
     exp_path = google_out_dir / "experiment.parquet"
     pq.write_table(table_exp, exp_path, compression="zstd")
+    _remember_table(
+        run_state,
+        "silver/google_qec/experiment.parquet",
+        _row_counts(in_exp, table_exp.num_rows, table_exp.num_rows, "experiment properties file"),
+    )
 
     # --------------------------------------------------------------------------
     # 3. Process Google QEC Shots
@@ -1209,6 +1496,11 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
 
     shot_path = google_out_dir / "shot.parquet"
     pq.write_table(table_shot, shot_path, compression="zstd")
+    _remember_table(
+        run_state,
+        "silver/google_qec/shot.parquet",
+        _row_counts(in_shot, table_shot.num_rows, table_shot.num_rows, "declared shot"),
+    )
 
     # --------------------------------------------------------------------------
     # 4. Process QASMBench 
@@ -1216,18 +1508,34 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     qasm_obj = "bronze/source=qasmbench/qasmbench-qec.zip"
     try:
         qasm_bytes, qasm_sha = get_bronze_archive(qasm_obj, settings, base_dir)
-    except Exception:
+        with zipfile.ZipFile(io.BytesIO(qasm_bytes)) as archive:
+            archive.namelist()
+    except Exception as exc:
         qasm_bytes, qasm_sha = None, None
+        _append_qasm_issue(
+            issues,
+            run_id,
+            "qasmbench:archive",
+            "RULE_QASM_ARCHIVE_UNAVAILABLE",
+            qasm_obj,
+            f"{type(exc).__name__}: {exc}",
+        )
+    run_state["input_hashes"][qasm_obj] = qasm_sha
 
-    qasm_tables, trace_qasm, in_qasm = prepare_qasmbench(
+    qasm_tables, trace_qasm, qasm_row_counts = prepare_qasmbench(
         qasm_bytes, qasm_obj, qasm_sha, run_id, base_dir, issues
     )
-    total_inputs += in_qasm
+    total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
         q_dir = silver_base / "qasmbench"
         q_dir.mkdir(parents=True, exist_ok=True)
         q_path = q_dir / f"{q_name}.parquet"
         pq.write_table(q_table, q_path, compression="zstd")
+        _remember_table(
+            run_state,
+            f"silver/qasmbench/{q_name}.parquet",
+            qasm_row_counts[q_name],
+        )
         total_outputs += q_table.num_rows
 
     # --------------------------------------------------------------------------
@@ -1244,7 +1552,12 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
         )
         for k in trace_syn
     }
-    save_source_traces(all_trace_cols, "all", trace_path, settings=settings)
+    trace_rows_loaded = save_source_traces(all_trace_cols, "all", trace_path, settings=settings)
+    _remember_table(
+        run_state,
+        "results/part1/source_trace.parquet",
+        _row_counts(trace_rows_loaded, trace_rows_loaded, trace_rows_loaded, "trace row"),
+    )
 
     # --------------------------------------------------------------------------
     # 6. Save Data Issues Table
@@ -1257,6 +1570,61 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
         table_issues = pa.Table.from_pylist([], schema=DATA_ISSUES_SCHEMA)
 
     pq.write_table(table_issues, issues_path, compression="zstd")
+    _remember_table(
+        run_state,
+        "results/part1/data_issues.parquet",
+        _row_counts(len(issues), len(issues), table_issues.num_rows, "issue finding"),
+    )
+
+    row_counts = {
+        "silver/qec_syndromes/syndrome_observation.parquet": _row_counts(
+            in_syn, table_syn.num_rows, table_syn.num_rows, "CSV data row"
+        ),
+        "silver/google_qec/experiment.parquet": _row_counts(
+            in_exp, table_exp.num_rows, table_exp.num_rows, "experiment properties file"
+        ),
+        "silver/google_qec/shot.parquet": _row_counts(
+            in_shot, table_shot.num_rows, table_shot.num_rows, "declared shot"
+        ),
+    }
+    row_counts.update({
+        f"silver/qasmbench/{table_name}.parquet": counts
+        for table_name, counts in qasm_row_counts.items()
+    })
+    row_counts["results/part1/source_trace.parquet"] = _row_counts(
+        trace_rows_loaded, trace_rows_loaded, trace_rows_loaded, "trace row"
+    )
+    row_counts["results/part1/data_issues.parquet"] = _row_counts(
+        len(issues), len(issues), len(issues), "issue finding"
+    )
+
+    output_table_counts = {
+        table_name: counts["rows_loaded"]
+        for table_name, counts in row_counts.items()
+    }
+    result.input_count = total_inputs
+    result.output_count = total_outputs
+    result.issue_count = len(issues)
+    result.finish()
+
+    row_counts_path = results_base / "row_counts.json"
+    run_path = results_base / "run.json"
+    _write_json(row_counts_path, {"run_id": run_id, "tables": row_counts})
+    _write_json(run_path, {
+        "run_id": run_id,
+        "stage": "prepare_data",
+        "status": "succeeded",
+        "input_hashes": {
+            syn_obj: syn_sha,
+            google_obj: google_sha,
+            qasm_obj: qasm_sha,
+        },
+        "git_revision": _git_revision(base_dir),
+        "started_at": result.started_at.isoformat(),
+        "ended_at": result.finished_at.isoformat(),
+        "issue_count": result.issue_count,
+        "output_table_counts": output_table_counts,
+    })
 
     # --------------------------------------------------------------------------
     # 7. Upload to MinIO (if configured)
@@ -1270,12 +1638,10 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
             for q_name in qasm_tables:
                 client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
+            client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
+            client.fput_object(settings.s3_bucket, "results/part1/run.json", str(run_path))
         except Exception:
-            pass
-
-    result.input_count = total_inputs
-    result.output_count = total_outputs
-    result.issue_count = len(issues)
-    result.finish()
+            logging.exception("MinIO upload failed during prepare_data run %s", run_id)
+            raise
 
     return result
