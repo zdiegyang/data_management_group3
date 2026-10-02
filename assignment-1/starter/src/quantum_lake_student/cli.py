@@ -13,6 +13,7 @@ from rich.table import Table
 from .config import Settings
 from .connections import bronze_inventory, check_platform
 from .stages import prepare_data, load_postgres
+from .stages import prepare_data, measure_detector
 
 
 console = Console()
@@ -66,6 +67,20 @@ def command_run(settings: Settings) -> int:
     )
 
     console.print("[bold green]✓ Part I Data Preparation completed successfully![/bold green]")
+
+    res_measure = measure_detector.run(run_id=run_id, settings=settings)
+    duration = (
+        (res_measure.finished_at - res_measure.started_at).total_seconds()
+        if res_measure.finished_at
+        else 0.0
+    )
+    console.print(
+        f"[green]✓ Measuring detector-event storage:[/green] "
+        f"{res_measure.input_count:,} inputs -> {res_measure.output_count:,} outputs "
+        f"({res_measure.issue_count} issues) in {duration:.2f}s"
+    )
+    console.print("[bold green]✓ Part I Detection-event storage measured and saved as JSON![/bold green]")
+
     return 0
 
 

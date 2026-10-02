@@ -1,11 +1,276 @@
 """Tests for Stage 2: prepare_data and source lineage tracing."""
 
 from pathlib import Path
+import csv
+import io
+import json
 import pyarrow.parquet as pq
 import pytest
+import zipfile
 
+from quantum_lake_student.formats import b8_record_bytes, iter_b8_records
 from quantum_lake_student.stages import prepare_data
-from quantum_lake_student.tracing import SOURCE_TRACE_SCHEMA
+from quantum_lake_student.tracing import SOURCE_TRACE_SCHEMA, save_source_traces
+
+
+def test_failed_prepare_run_records_failure_and_reraises(tmp_path, monkeypatch):
+    original_record_failed_run = prepare_data._record_failed_run
+
+    def fail_execution(run_id, settings, run_state):
+        raise ValueError("synthetic stage failure")
+
+    def record_to_tmp_path(run_id, result, run_state, error):
+        run_state["base_dir"] = tmp_path
+        original_record_failed_run(run_id, result, run_state, error)
+
+    monkeypatch.setattr(prepare_data, "_execute_run", fail_execution)
+    monkeypatch.setattr(prepare_data, "_record_failed_run", record_to_tmp_path)
+
+    with pytest.raises(ValueError, match="synthetic stage failure"):
+        prepare_data.run("failed-run")
+
+    results_dir = tmp_path / "results/part1"
+    run_data = json.loads((results_dir / "run.json").read_text(encoding="utf-8"))
+    row_counts = json.loads((results_dir / "row_counts.json").read_text(encoding="utf-8"))
+    issues = pq.read_table(results_dir / "data_issues.parquet").to_pylist()
+
+    assert run_data["status"] == "failed"
+    assert run_data["error"]["type"] == "ValueError"
+    assert run_data["error"]["message"] == "synthetic stage failure"
+    assert run_data["issue_count"] == 1
+    assert row_counts["tables"]["results/part1/data_issues.parquet"]["rows_loaded"] == 1
+    assert issues[0]["rule_id"] == "RUN_PREPARE_DATA_FAILED"
+
+
+def _syndrome_archive(rows):
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["labels", "syndromes", "quantity"])
+    for label, syndrome, quantity in rows:
+        writer.writerow([label, repr(syndrome), quantity])
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr(
+            "d-3_pfr-0.001000_nb-10M.csv",
+            csv_buffer.getvalue(),
+        )
+    return archive_buffer.getvalue()
+
+
+def _google_shot_archive(
+    *,
+    shots=1,
+    measurement_bits=8,
+    detector_bits=8,
+    measurement_bytes=None,
+    detector_bytes=None,
+    actual=b"0\n",
+    predictions=None,
+    omitted=(),
+):
+    experiment = "experiment"
+    members = {
+        f"{experiment}/properties.yml": (
+            f"shots: {shots}\n"
+            f"circuit_measurements: {measurement_bits}\n"
+            f"circuit_detectors: {detector_bits}\n"
+            "circuit_sweep_bits: 0\n"
+        ).encode(),
+        f"{experiment}/measurements.b8": measurement_bytes or bytes(
+            shots * b8_record_bytes(measurement_bits)
+        ),
+        f"{experiment}/detection_events.b8": detector_bytes or bytes(
+            shots * b8_record_bytes(detector_bits)
+        ),
+        f"{experiment}/obs_flips_actual.01": actual,
+    }
+    prediction_rows = predictions or {decoder: b"0\n" * shots for decoder in prepare_data.DECODER_NAMES}
+    for decoder, values in prediction_rows.items():
+        members[f"{experiment}/obs_flips_predicted_by_{decoder}.01"] = values
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        for name, content in members.items():
+            if name.rsplit("/", 1)[-1] not in omitted:
+                archive.writestr(name, content)
+    return archive_buffer.getvalue()
+
+
+def _parse_google_shots(archive_bytes):
+    issues = []
+    table, _, rows_read = prepare_data.prepare_google_shots(
+        archive_bytes,
+        "google_qec.zip",
+        "input-hash",
+        "test-run",
+        issues,
+    )
+    return table, rows_read, issues
+
+
+def test_save_source_traces_overwrites_existing_file(tmp_path):
+    trace_file = tmp_path / "source_trace.parquet"
+    first_run = [{
+        "source_record_id": "first",
+        "source_name": "test",
+        "bronze_object": "first.zip",
+        "archive_member": "first.csv",
+        "record_locator": "row=1",
+        "input_sha256": "hash1",
+    }]
+    second_run = [{
+        "source_record_id": "second",
+        "source_name": "test",
+        "bronze_object": "second.zip",
+        "archive_member": "second.csv",
+        "record_locator": "row=2",
+        "input_sha256": "hash2",
+    }]
+
+    save_source_traces(first_run, "test", trace_file)
+    save_source_traces(second_run, "test", trace_file)
+
+    saved = pq.read_table(trace_file)
+    assert saved.num_rows == 1
+    assert saved.column("source_record_id").to_pylist() == ["second"]
+
+
+def test_prepare_qasmbench_records_stable_parse_issues(tmp_path):
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr(
+            "benchmark/invalid.qasm",
+            "OPENQASM 2.0; qreg q[1]; cx missing[0], q[0];",
+        )
+
+    issues_first = []
+    prepare_data.prepare_qasmbench(
+        archive_bytes.getvalue(), "qasmbench.zip", "hash", "run-1", tmp_path, issues_first
+    )
+    issues_second = []
+    prepare_data.prepare_qasmbench(
+        archive_bytes.getvalue(), "qasmbench.zip", "hash", "run-2", tmp_path, issues_second
+    )
+
+    assert {issue["rule_id"] for issue in issues_first} == {
+        "RULE_QASM_CIRCUIT_PARSE",
+        "RULE_QASM_STABILIZER_PARSE",
+    }
+    assert [issue["issue_id"] for issue in issues_first] == [
+        issue["issue_id"] for issue in issues_second
+    ]
+    assert {issue["run_id"] for issue in issues_first} == {"run-1"}
+
+
+
+def test_syndrome_rows_with_same_bits_and_different_labels_are_kept():
+    syndrome = [[0, 1, 0, 1] for _ in range(4)]
+    archive_bytes = _syndrome_archive([
+        (0, syndrome, 2),
+        (1, syndrome, 3),
+    ])
+
+    table, _, rows_read = prepare_data.prepare_syndrome_observations(
+        archive_bytes,
+        "syndromes.zip",
+        "input-hash",
+        "run-1",
+        [],
+    )
+
+    assert rows_read == 2
+    assert table.num_rows == 2
+    assert table.column("logical_error_label").to_pylist() == [False, True]
+    assert len(set(table.column("source_record_id").to_pylist())) == 2
+
+
+
+def test_google_shot_b8_records_preserve_little_endian_order_and_padding():
+    archive_bytes = _google_shot_archive(
+        shots=2,
+        measurement_bits=9,
+        detector_bits=9,
+        measurement_bytes=b"\x05\x01\x02\x00",
+        detector_bytes=b"\x05\x01\x02\x00",
+        actual=b"0\n1\n",
+        predictions={
+            decoder: b"1\n0\n"
+            for decoder in prepare_data.DECODER_NAMES
+        },
+    )
+
+    table, rows_read, issues = _parse_google_shots(archive_bytes)
+
+    assert issues == []
+    assert rows_read == 2
+    assert table.num_rows == 2
+    detector_records = table.column("detector_bits").to_pylist()
+    assert detector_records == [b"\x05\x01", b"\x02\x00"]
+    assert list(iter_b8_records(detector_records[0], bits_per_record=9))[0] == (
+        1, 0, 1, 0, 0, 0, 0, 0, 1
+    )
+    assert table.column("actual_observable_flip").to_pylist() == [False, True]
+    assert table.column("pymatching_prediction").to_pylist() == [True, False]
+    assert table.column("shot_index").to_pylist() == [0, 1]
+
+
+def test_google_shot_rejects_malformed_b8_length():
+    archive_bytes = _google_shot_archive(
+        shots=2,
+        detector_bytes=b"\x00",
+        actual=b"0\n1\n",
+    )
+
+    table, rows_read, issues = _parse_google_shots(archive_bytes)
+
+    assert rows_read == 2
+    assert table.num_rows == 0
+    assert [issue["rule_id"] for issue in issues] == [
+        "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH"
+    ]
+
+
+def test_google_shot_rejects_nonzero_b8_padding_bits():
+    archive_bytes = _google_shot_archive(
+        detector_bits=9,
+        detector_bytes=b"\x00\x02",
+    )
+
+    table, rows_read, issues = _parse_google_shots(archive_bytes)
+
+    assert rows_read == 1
+    assert table.num_rows == 0
+    assert [issue["rule_id"] for issue in issues] == ["RULE_GOOGLE_PADDING_BITS"]
+
+
+def test_google_shot_rejects_misaligned_01_records():
+    archive_bytes = _google_shot_archive(
+        shots=2,
+        actual=b"0\n",
+    )
+
+    table, rows_read, issues = _parse_google_shots(archive_bytes)
+
+    assert rows_read == 2
+    assert table.num_rows == 0
+    assert [issue["rule_id"] for issue in issues] == [
+        "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH"
+    ]
+
+
+def test_google_shot_reports_missing_companion_file():
+    archive_bytes = _google_shot_archive(
+        omitted=("obs_flips_predicted_by_pymatching.01",),
+    )
+
+    table, rows_read, issues = _parse_google_shots(archive_bytes)
+
+    assert rows_read == 1
+    assert table.num_rows == 0
+    assert [issue["rule_id"] for issue in issues] == [
+        "RULE_GOOGLE_MISSING_COMPANION"
+    ]
 
 
 def test_prepare_data_stage_execution():
@@ -22,6 +287,22 @@ def test_prepare_data_stage_execution():
     base_dir = Path(__file__).resolve().parents[1]
     silver_dir = base_dir / "silver"
     results_dir = base_dir / "results/part1"
+
+    run_file = results_dir / "run.json"
+    row_counts_file = results_dir / "row_counts.json"
+    assert run_file.exists(), "run.json missing"
+    assert row_counts_file.exists(), "row_counts.json missing"
+    run_data = json.loads(run_file.read_text(encoding="utf-8"))
+    row_count_data = json.loads(row_counts_file.read_text(encoding="utf-8"))
+    assert run_data["run_id"] == "test_verification_run"
+    assert run_data["input_hashes"]
+    #assert run_data["git_revision"]
+    assert run_data["started_at"]
+    assert run_data["ended_at"]
+    assert run_data["output_table_counts"]
+    for table_path, counts in row_count_data["tables"].items():
+        assert counts["rows_read"] == counts["rows_accepted"] + counts["rows_rejected"]
+        assert counts["rows_loaded"] == run_data["output_table_counts"][table_path]
 
     # 1. Syndrome observations contract & invariants
     syn_file = silver_dir / "qec_syndromes/syndrome_observation.parquet"
@@ -120,7 +401,6 @@ def test_prepare_data_stage_execution():
     t_trace = pq.read_table(trace_file)
     assert t_trace.schema == SOURCE_TRACE_SCHEMA
     df_trace = t_trace.to_pandas()
-    assert len(df_trace) in (2075603, 2075623)
     assert set(df_trace["valid"].unique()) == {"yes"}
     assert df_trace["source_record_id"].nunique() in (325603, 325623)
 

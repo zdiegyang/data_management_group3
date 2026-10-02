@@ -1,4 +1,6 @@
 .Trash-0/
 **/.ipynb_checkpoints/
+assignment-1/starter/silver
+assignment-1/starter/results/**/*.parquet
 .idea
 .venv
