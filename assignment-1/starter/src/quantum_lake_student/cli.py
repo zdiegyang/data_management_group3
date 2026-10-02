@@ -12,8 +12,7 @@ from rich.table import Table
 
 from .config import Settings
 from .connections import bronze_inventory, check_platform
-from .stages import prepare_data, load_postgres
-from .stages import prepare_data, measure_detector
+from .stages import load_postgres, measure_detector, prepare_data, register_sources
 
 
 console = Console()
@@ -39,6 +38,20 @@ def command_inventory(settings: Settings) -> int:
 def command_run(settings: Settings) -> int:
     run_id = f"run_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
     console.print(f"[bold blue]Starting Part I Pipeline (Run ID: {run_id})...[/bold blue]")
+
+    # Stage 1: Bronze verification. Raises on a missing object, checksum
+    # mismatch, or unsafe archive member, which stops the run before parsing.
+    res_bronze = register_sources.run(run_id=run_id)
+    duration = (
+        (res_bronze.finished_at - res_bronze.started_at).total_seconds()
+        if res_bronze.finished_at
+        else 0.0
+    )
+    console.print(
+        f"[green]✓ Stage 1 (register_sources):[/green] "
+        f"{res_bronze.output_count}/{res_bronze.input_count} Bronze objects verified "
+        f"({res_bronze.issue_count} unexpected objects) in {duration:.2f}s"
+    )
 
     # Stage 2: Data Preparation & Silver
     res_prep = prepare_data.run(run_id=run_id, settings=settings)

@@ -1,5 +1,15 @@
 {
-  "run_id": "test_verification_run",
+  "run_id": "run_20261002_124315",
+  "silver_to_gold": {
+    "circuit": 6,
+    "conditional_correction": 6,
+    "decoder_prediction": 1000000,
+    "google_experiment": 5,
+    "google_shot": 250000,
+    "sim_experiment": 7,
+    "stabilizer_check": 8,
+    "syndrome_observation": 75598
+  },
   "tables": {
     "results/part1/data_issues.parquet": {
       "rows_accepted": 0,
