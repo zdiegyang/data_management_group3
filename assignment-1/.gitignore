@@ -6,6 +6,8 @@
 starter/lake/
 starter/reports/
 starter/.coverage
+.idea
+.venv
 
 starter/results/part1/data_issues.parquet
 starter/results/part1/source_trace.parquet

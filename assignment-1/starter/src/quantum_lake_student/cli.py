@@ -12,7 +12,7 @@ from rich.table import Table
 
 from .config import Settings
 from .connections import bronze_inventory, check_platform
-from .stages import prepare_data
+from .stages import prepare_data, load_postgres
 
 
 console = Console()
@@ -50,6 +50,19 @@ def command_run(settings: Settings) -> int:
         f"[green]✓ Stage 2 (prepare_data):[/green] "
         f"{res_prep.input_count:,} inputs -> {res_prep.output_count:,} outputs "
         f"({res_prep.issue_count} issues) in {duration:.2f}s"
+    )
+
+    # Stage 3: Silver -> Gold (PostgreSQL)
+    res_gold = load_postgres.run(run_id=run_id)
+    duration = (
+        (res_gold.finished_at - res_gold.started_at).total_seconds()
+        if res_gold.finished_at
+        else 0.0
+    )
+    console.print(
+        f"[green]✓ Stage 3 (load_postgres):[/green] "
+        f"{res_gold.input_count:,} inputs -> {res_gold.output_count:,} outputs "
+        f"({res_gold.issue_count} issues) in {duration:.2f}s"
     )
 
     console.print("[bold green]✓ Part I Data Preparation completed successfully![/bold green]")
