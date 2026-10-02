@@ -8,3 +8,12 @@ starter/reports/
 starter/.coverage
 .idea
 .venv
+
+starter/results/part1/data_issues.parquet
+starter/results/part1/source_trace.parquet
+starter/silver/google_qec/experiment.parquet
+starter/silver/google_qec/shot.parquet
+starter/silver/qasmbench/circuit.parquet
+starter/silver/qasmbench/conditional_correction.parquet
+starter/silver/qasmbench/stabilizer_check.parquet
+starter/silver/qec_syndromes/syndrome_observation.parquet
