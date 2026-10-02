@@ -18,8 +18,6 @@ import io
 import json
 import logging
 from pathlib import Path
-import subprocess
-import traceback
 from typing import Any
 import zipfile
 import yaml
@@ -119,6 +117,168 @@ def _append_qasm_issue(
     })
 
 
+class MissingCompanionFileError(RuntimeError):
+    """A Google experiment lacks a required companion file; the run must stop."""
+
+
+# Every Silver rule: (source, what is checked, unit, action on failure).
+# Brief: "Record the outcome of every check." Failures also go to data_issues.
+CHECK_CATALOG: dict[str, tuple[str, str, str, str]] = {
+    "RULE_SYN_FILENAME_PFR": ("qec_syndromes", "physical fault rate parses from the file name", "CSV file", "exclude file"),
+    "RULE_SYN_EMPTY_FILE": ("qec_syndromes", "CSV file has a header row", "CSV file", "exclude file"),
+    "RULE_SYN_HEADER_DOCUMENTED": ("qec_syndromes", "CSV header compared with the columns documented in README.txt", "CSV file", "record observation"),
+    "RULE_SYN_HEADER": ("qec_syndromes", "header is labels,syndromes,quantity (or the documented label,...)", "CSV file", "log warning"),
+    "RULE_SYN_ROW_LEN": ("qec_syndromes", "row has exactly 3 fields", "CSV row", "exclude row"),
+    "RULE_SYN_LABEL_DOMAIN": ("qec_syndromes", "label is 0 or 1", "CSV row", "exclude row"),
+    "RULE_SYN_SHAPE_DOMAIN": ("qec_syndromes", "syndrome is 4 rounds x 4 checks of binary values", "CSV row", "exclude row"),
+    "RULE_SYN_QUANTITY_POSITIVE": ("qec_syndromes", "quantity is an integer greater than zero", "CSV row", "exclude row"),
+    "RULE_SYN_WEIGHTED_TOTAL": ("qec_syndromes", "accepted quantities of a file sum to the nb-<N> count in its name", "CSV file", "log error"),
+    "RULE_SYN_SAME_SYNDROME_BOTH_LABELS": ("qec_syndromes", "a syndrome occurring with both labels in one file is valid and kept", "distinct (file, syndrome)", "record observation"),
+    "RULE_EXP_PROPERTIES": ("google_qec", "properties.yml parses with valid basis, distance, rounds and shots", "experiment", "exclude experiment"),
+    "RULE_GOOGLE_NAME_PROPERTIES": ("google_qec", "directory name agrees with properties.yml", "experiment", "exclude experiment and its shots"),
+    "RULE_GOOGLE_MISSING_COMPANION": ("google_qec", "every required companion file is present", "experiment", "stop run"),
+    "RULE_GOOGLE_01_BINARY": ("google_qec", "every .01 line is 0 or 1", ".01 file", "stop run"),
+    "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH": ("google_qec", "b8 lengths equal shots x ceil(bits/8) and .01 line counts equal shots", "experiment", "exclude experiment"),
+    "RULE_GOOGLE_PADDING_BITS": ("google_qec", "unused padding bits of every b8 record are zero", "shot", "exclude shot"),
+    "RULE_QASM_ARCHIVE_UNAVAILABLE": ("qasmbench", "QASMBench archive can be read", "archive", "exclude source"),
+    "RULE_QASM_CIRCUIT_PARSE": ("qasmbench", "circuit registers and operation counts parse", "QASM file", "exclude circuit"),
+    "RULE_QASM_STABILIZER_PARSE": ("qasmbench", "parity checks parse", "QASM file", "exclude file's checks"),
+    "RULE_QASM_CORRECTION_PARSE": ("qasmbench", "conditional corrections parse", "QASM file", "exclude file's corrections"),
+}
+
+
+def _record_check(
+    checks: dict[str, dict[str, Any]] | None,
+    rule_id: str,
+    checked: int = 1,
+    observation: str | None = None,
+) -> None:
+    """Count how many records a rule evaluated, plus any expected observation."""
+    if checks is None:
+        return
+    entry = checks.setdefault(rule_id, {"checked": 0, "observations": []})
+    entry["checked"] += checked
+    if observation and observation not in entry["observations"]:
+        entry["observations"].append(observation)
+
+
+def _check_outcomes(
+    checks: dict[str, dict[str, Any]],
+    issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Outcome of every catalogued rule: how many records it checked, passed and failed."""
+    failed_by_rule: dict[str, int] = {}
+    for issue in issues:
+        failed_by_rule[issue["rule_id"]] = failed_by_rule.get(issue["rule_id"], 0) + 1
+    outcomes = []
+    for rule_id, (source, description, unit, on_failure) in CHECK_CATALOG.items():
+        entry = checks.get(rule_id, {"checked": 0, "observations": []})
+        failed = failed_by_rule.get(rule_id, 0)
+        if failed:
+            outcome = "failed"
+        elif entry["observations"]:
+            outcome = "observed"
+        elif entry["checked"]:
+            outcome = "passed"
+        else:
+            outcome = "not evaluated"
+        outcomes.append({
+            "rule_id": rule_id,
+            "source": source,
+            "check": description,
+            "unit": unit,
+            "on_failure": on_failure,
+            "checked": entry["checked"],
+            "failed": failed,
+            "passed": max(entry["checked"] - failed, 0),
+            "outcome": outcome,
+            "observations": entry["observations"],
+        })
+    return outcomes
+
+
+NOMINAL_SAMPLES = re.compile(r"_nb-(\d+)([KMG]?)", re.IGNORECASE)
+SAMPLE_SUFFIX = {"": 1, "K": 1_000, "M": 1_000_000, "G": 1_000_000_000}
+
+
+def _check_weighted_total(
+    member: str,
+    file_weight: int,
+    run_id: str,
+    issues: list[dict[str, Any]],
+    checks: dict[str, dict[str, Any]] | None,
+) -> None:
+    """Rule: the accepted quantities of one CSV sum to the nb-<N> count in its name."""
+    _record_check(checks, "RULE_SYN_WEIGHTED_TOTAL")
+    match = NOMINAL_SAMPLES.search(member)
+    if match is None:
+        declared = None
+        reason = "File name has no nb-<count> token to reconcile the quantities against"
+    else:
+        declared = int(match.group(1)) * SAMPLE_SUFFIX[match.group(2).upper()]
+        if file_weight == declared:
+            return
+        reason = f"Accepted quantities sum to {file_weight}, the file name declares {declared}"
+    source_record_id = f"qec_syndromes:{member}"
+    observed_value = f"sum={file_weight};declared={declared}"
+    issues.append({
+        "issue_id": _stable_issue_id(source_record_id, "RULE_SYN_WEIGHTED_TOTAL", observed_value),
+        "run_id": run_id,
+        "source_record_id": source_record_id,
+        "rule_id": "RULE_SYN_WEIGHTED_TOTAL",
+        "severity": "error",
+        "observed_value": observed_value,
+        "action": "logged",
+        "reason": reason,
+    })
+
+
+DOCUMENTED_COLUMN = re.compile(r"^\s*-\s*(\w+)\s*:", re.MULTILINE)
+
+
+def _documented_syndrome_columns(archive: zipfile.ZipFile) -> list[str] | None:
+    """Column names listed in the syndrome archive README, if it has one."""
+    readme = next(
+        (name for name in archive.namelist() if Path(name).name.lower().startswith("readme")),
+        None,
+    )
+    if readme is None:
+        return None
+    return DOCUMENTED_COLUMN.findall(archive.read(readme).decode("utf-8", errors="replace"))
+
+
+GOOGLE_EXPERIMENT_DIR = re.compile(
+    r"^(?P<code>[a-z_]+?)_b(?P<basis>[A-Z])_d(?P<distance>\d+)_r(?P<rounds>\d+)"
+    r"_center_(?P<row>\d+)_(?P<col>\d+)$"
+)
+
+
+def _experiment_name_mismatches(exp_dir: str, prop: dict[str, Any]) -> list[str]:
+    """Compare `{code}_b{basis}_d{distance}_r{rounds}_center_{row}_{col}` (the
+    pattern documented in the Google README) with the values in properties.yml."""
+    match = GOOGLE_EXPERIMENT_DIR.fullmatch(exp_dir)
+    if match is None:
+        return ["name does not follow {code}_b{basis}_d{distance}_r{rounds}_center_{row}_{col}"]
+    declared = {
+        "code": str(prop.get("type", "")),
+        "basis": str(prop.get("basis")),
+        "distance": str(prop.get("distance")),
+        "rounds": str(prop.get("rounds")),
+        "row": str(prop.get("center_data_qubit_row")),
+        "col": str(prop.get("center_data_qubit_col")),
+    }
+    mismatches = []
+    for field, from_name in match.groupdict().items():
+        # properties.yml `type` is e.g. surface_code_memory_experiment; the name holds its prefix.
+        if field == "code":
+            agrees = declared[field].startswith(from_name)
+        else:
+            agrees = declared[field] == from_name
+        if not agrees:
+            mismatches.append(f"{field}: name={from_name} properties={declared[field]}")
+    return mismatches
+
+
 def _row_counts(
     rows_read: int,
     rows_accepted: int,
@@ -135,21 +295,6 @@ def _row_counts(
         "rows_rejected": rows_rejected,
         "rows_loaded": rows_loaded,
     }
-
-
-def _git_revision(base_dir: Path) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=base_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    revision = result.stdout.strip()
-    return revision or None
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -216,27 +361,11 @@ def _record_failed_run(
     result.issue_count = len(issues)
     result.finish()
     row_counts_path = results_base / "row_counts.json"
-    run_path = results_base / "run.json"
     try:
+        # run.json (status, error, hashes) is written once per run by the CLI.
         _write_json(row_counts_path, {"run_id": run_id, "tables": row_counts})
-        _write_json(run_path, {
-            "run_id": run_id,
-            "stage": "prepare_data",
-            "status": "failed",
-            "input_hashes": run_state.get("input_hashes", {}),
-            "git_revision": _git_revision(base_dir),
-            "started_at": result.started_at.isoformat(),
-            "ended_at": result.finished_at.isoformat(),
-            "issue_count": result.issue_count,
-            "output_table_counts": output_table_counts,
-            "error": {
-                "type": type(error).__name__,
-                "message": error_message,
-                "traceback": "".join(traceback.format_exception(error)),
-            },
-        })
     except Exception:
-        logging.exception("Could not persist failed run metadata for %s", run_id)
+        logging.exception("Could not persist failed run row counts for %s", run_id)
 
     settings = run_state.get("settings")
     if settings and settings.lake_backend == "minio":
@@ -244,7 +373,6 @@ def _record_failed_run(
             client = minio_client(settings)
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
             client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
-            client.fput_object(settings.s3_bucket, "results/part1/run.json", str(run_path))
         except Exception:
             logging.exception("Could not upload failed run metadata for %s", run_id)
 
@@ -341,6 +469,7 @@ def prepare_syndrome_observations(
     bronze_sha256: str,
     run_id: str,
     issues: list[dict[str, Any]],
+    checks: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[pa.Table, dict[str, list[Any]], int]:
     """Parse simulated syndrome CSV files, validate invariants, and extract traces."""
     silver_rows = []
@@ -357,8 +486,10 @@ def prepare_syndrome_observations(
 
     with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as z:
         csv_members = sorted([name for name in z.namelist() if name.endswith(".csv") and not name.startswith("__MACOSX")])
+        documented_columns = _documented_syndrome_columns(z)
         for member in csv_members:
             stem = Path(member).stem
+            _record_check(checks, "RULE_SYN_FILENAME_PFR")
             # Parse physical fault rate from filename: d-3_pfr-0.001000_nb-10M.csv
             try:
                 pfr_str = member.split("_pfr-")[1].split("_")[0]
@@ -379,9 +510,11 @@ def prepare_syndrome_observations(
                 continue
 
             exp_id = stem
+            file_weight = 0
 
             with z.open(member) as f:
                 reader = csv.reader(io.TextIOWrapper(f, encoding="utf-8"))
+                _record_check(checks, "RULE_SYN_EMPTY_FILE")
                 try:
                     header = next(reader)
                 except StopIteration:
@@ -399,6 +532,16 @@ def prepare_syndrome_observations(
                     })
                     continue
 
+                # The README documents a column `label`; the files use `labels`.
+                # Expected observation: columns are read by position, not by name.
+                header_observation = None
+                if documented_columns and header != documented_columns:
+                    header_observation = (
+                        f"README documents columns {documented_columns}; CSV header is {header}"
+                    )
+                _record_check(checks, "RULE_SYN_HEADER_DOCUMENTED", observation=header_observation)
+
+                _record_check(checks, "RULE_SYN_HEADER")
                 if header not in (["labels", "syndromes", "quantity"], ["label", "syndromes", "quantity"]):
                     issues.append({
                         "issue_id": _stable_issue_id(
@@ -420,6 +563,7 @@ def prepare_syndrome_observations(
                     source_record_id = f"qec_syndromes:{member}:row:{row_idx}"
                     record_locator = f"row:{row_idx}"
 
+                    _record_check(checks, "RULE_SYN_ROW_LEN")
                     if len(row) != 3:
                         issues.append({
                             "issue_id": _stable_issue_id(
@@ -443,6 +587,7 @@ def prepare_syndrome_observations(
                         continue
 
                     # Validate label
+                    _record_check(checks, "RULE_SYN_LABEL_DOMAIN")
                     try:
                         label_val = int(row[0].strip())
                         if label_val not in (0, 1):
@@ -471,6 +616,7 @@ def prepare_syndrome_observations(
                         continue
 
                     # Validate 4x4 syndrome sequence
+                    _record_check(checks, "RULE_SYN_SHAPE_DOMAIN")
                     try:
                         syndrome_tuple = ast.literal_eval(row[1].strip())
                         if len(syndrome_tuple) != 4 or not all(len(r) == 4 for r in syndrome_tuple):
@@ -502,6 +648,7 @@ def prepare_syndrome_observations(
                         continue
 
                     # Validate quantity
+                    _record_check(checks, "RULE_SYN_QUANTITY_POSITIVE")
                     try:
                         quantity = int(row[2].strip())
                         if quantity <= 0:
@@ -547,9 +694,12 @@ def prepare_syndrome_observations(
                     trace_cols["record_locator"].append(record_locator)
                     trace_cols["input_sha256"].append(bronze_sha256)
                     trace_cols["valid"].append("yes")
+                    file_weight += quantity
 
-    df_silver = pd.DataFrame(silver_rows)
-    table_silver = pa.Table.from_pandas(df_silver, schema=SYNDROME_OBSERVATION_SCHEMA, preserve_index=False)
+            _check_weighted_total(member, file_weight, run_id, issues, checks)
+
+    # from_pylist keeps the schema even when every row was rejected.
+    table_silver = pa.Table.from_pylist(silver_rows, schema=SYNDROME_OBSERVATION_SCHEMA)
     return table_silver, trace_cols, input_records_count
 
 
@@ -563,6 +713,7 @@ def prepare_google_experiments(
     bronze_sha256: str,
     run_id: str,
     issues: list[dict[str, Any]],
+    checks: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[pa.Table, dict[str, list[Any]], int]:
     """Parse Google QEC experiment directories and properties.yml."""
     experiment_rows = []
@@ -583,6 +734,7 @@ def prepare_google_experiments(
             input_records_count += 1
             exp_dir = ym.split("/")[0]
             source_record_id = f"google_qec:{exp_dir}:properties.yml"
+            _record_check(checks, "RULE_EXP_PROPERTIES")
 
             try:
                 raw_yaml = z.read(ym).decode("utf-8")
@@ -599,6 +751,31 @@ def prepare_google_experiments(
 
                 if basis not in ("X", "Z") or distance not in (3, 5) or rounds <= 0 or shots <= 0:
                     raise ValueError(f"Invalid experiment property values in {ym}")
+
+                _record_check(checks, "RULE_GOOGLE_NAME_PROPERTIES")
+                mismatches = _experiment_name_mismatches(exp_dir, prop)
+                if mismatches:
+                    observed_value = "; ".join(mismatches)
+                    issues.append({
+                        "issue_id": _stable_issue_id(
+                            source_record_id, "RULE_GOOGLE_NAME_PROPERTIES", observed_value
+                        ),
+                        "run_id": run_id,
+                        "source_record_id": source_record_id,
+                        "rule_id": "RULE_GOOGLE_NAME_PROPERTIES",
+                        "severity": "error",
+                        "observed_value": observed_value,
+                        "action": "excluded",
+                        "reason": "Experiment directory name disagrees with properties.yml",
+                    })
+                    trace_cols["source_record_id"].append(source_record_id)
+                    trace_cols["source_name"].append("google_qec")
+                    trace_cols["bronze_object"].append(bronze_object_name)
+                    trace_cols["archive_member"].append(ym)
+                    trace_cols["record_locator"].append("properties.yml")
+                    trace_cols["input_sha256"].append(bronze_sha256)
+                    trace_cols["valid"].append("no")
+                    continue
 
                 experiment_rows.append({
                     "source_record_id": source_record_id,
@@ -642,8 +819,8 @@ def prepare_google_experiments(
                 trace_cols["input_sha256"].append(bronze_sha256)
                 trace_cols["valid"].append("no")
 
-    df_experiment = pd.DataFrame(experiment_rows)
-    table_experiment = pa.Table.from_pandas(df_experiment, schema=GOOGLE_EXPERIMENT_SCHEMA, preserve_index=False)
+    # from_pylist keeps the schema even when every experiment was rejected.
+    table_experiment = pa.Table.from_pylist(experiment_rows, schema=GOOGLE_EXPERIMENT_SCHEMA)
     return table_experiment, trace_cols, input_records_count
 
 
@@ -657,6 +834,8 @@ def prepare_google_shots(
     bronze_sha256: str,
     run_id: str,
     issues: list[dict[str, Any]],
+    checks: dict[str, dict[str, Any]] | None = None,
+    excluded_experiments: set[str] | None = None,
 ) -> tuple[pa.Table, dict[str, list[Any]], int]:
     """Parse aligned hardware shots across 8 companion member files.
 
@@ -702,6 +881,11 @@ def prepare_google_shots(
             num_sweep = int(prop.get("circuit_sweep_bits", 0))
             input_records_count += shots
 
+            # Shots of an experiment rejected in the experiment table are not
+            # published either; the issue is recorded once, at experiment level.
+            if excluded_experiments and exp in excluded_experiments:
+                continue
+
             meas_stride = b8_record_bytes(num_meas)
             det_stride = b8_record_bytes(num_det)
             sweep_stride = b8_record_bytes(num_sweep) if num_sweep > 0 else 0
@@ -710,7 +894,8 @@ def prepare_google_shots(
             det_file = f"{exp}/detection_events.b8"
             meas_file = f"{exp}/measurements.b8"
             sweep_file = f"{exp}/sweep.b8"
-            has_sweep = (sweep_file in member_set and sweep_stride > 0)
+            # sweep.b8 is required whenever properties.yml declares sweep bits.
+            has_sweep = num_sweep > 0
             actual_file = f"{exp}/obs_flips_actual.01"
 
             decoder_files = {
@@ -719,10 +904,11 @@ def prepare_google_shots(
             }
 
             # Check presence of mandatory companion files
-            missing_companions = [
-                f for f in [det_file, meas_file, actual_file, *decoder_files.values()]
-                if f not in member_set
-            ]
+            required_companions = [det_file, meas_file, actual_file, *decoder_files.values()]
+            if has_sweep:
+                required_companions.append(sweep_file)
+            missing_companions = [f for f in required_companions if f not in member_set]
+            _record_check(checks, "RULE_GOOGLE_MISSING_COMPANION")
             if missing_companions:
                 issues.append({
                     "issue_id": _stable_issue_id(
@@ -735,15 +921,19 @@ def prepare_google_shots(
                     "rule_id": "RULE_GOOGLE_MISSING_COMPANION",
                     "severity": "error",
                     "observed_value": str(missing_companions),
-                    "action": "excluded",
+                    "action": "stopped run",
                     "reason": f"Experiment {exp} missing required companion files",
                 })
-                continue
+                # Brief: "a missing required companion file ... must stop the run."
+                raise MissingCompanionFileError(
+                    f"Experiment {exp} is missing required companion files: {missing_companions}"
+                )
 
             # Read all companion streams into memory
             det_raw = z.read(det_file)
             meas_raw = z.read(meas_file)
             sweep_raw = z.read(sweep_file) if has_sweep else b""
+            _record_check(checks, "RULE_GOOGLE_01_BINARY", checked=1 + len(decoder_files))
             act_raw = parse_01_records(z.read(actual_file))
 
             dec_streams = {}
@@ -751,6 +941,7 @@ def prepare_google_shots(
                 dec_streams[dec] = parse_01_records(z.read(dfpath))
 
             # Pre-validate companion file sizes / line counts
+            _record_check(checks, "RULE_GOOGLE_COMPANION_STRIDE_MISMATCH")
             if (
                 len(det_raw) != shots * det_stride
                 or len(meas_raw) != shots * meas_stride
@@ -788,17 +979,19 @@ def prepare_google_shots(
                 is_valid = True
                 invalid_reason = ""
 
-                if det_rem != 0:
-                    last_det_byte = d_chunk[-1]
-                    if (last_det_byte >> det_rem) != 0:
+                invalid_value = ""
+                _record_check(checks, "RULE_GOOGLE_PADDING_BITS")
+                padded_records = [
+                    ("detection_events.b8", d_chunk, det_rem),
+                    ("measurements.b8", m_chunk, meas_rem),
+                    ("sweep.b8", sw_chunk, num_sweep % 8 if has_sweep else 0),
+                ]
+                for file_name, chunk, used_bits in padded_records:
+                    if used_bits and (chunk[-1] >> used_bits) != 0:
                         is_valid = False
-                        invalid_reason = "Non-zero padding bits in detection_events.b8"
-
-                if meas_rem != 0:
-                    last_meas_byte = m_chunk[-1]
-                    if (last_meas_byte >> meas_rem) != 0:
-                        is_valid = False
-                        invalid_reason = "Non-zero padding bits in measurements.b8"
+                        invalid_reason = f"Non-zero padding bits in {file_name}"
+                        invalid_value = f"{file_name}:last_byte={chunk[-1]}"
+                        break
 
                 event_cnt = int.from_bytes(d_chunk, "little").bit_count()
 
@@ -837,13 +1030,13 @@ def prepare_google_shots(
                         "issue_id": _stable_issue_id(
                             shot_id,
                             "RULE_GOOGLE_PADDING_BITS",
-                            str(d_chunk[-1] if det_rem else m_chunk[-1]),
+                            invalid_value,
                         ),
                         "run_id": run_id,
                         "source_record_id": shot_id,
                         "rule_id": "RULE_GOOGLE_PADDING_BITS",
                         "severity": "error",
-                        "observed_value": str(d_chunk[-1] if det_rem else m_chunk[-1]),
+                        "observed_value": invalid_value,
                         "action": "excluded",
                         "reason": invalid_reason,
                     })
@@ -1417,6 +1610,27 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
         raise
 
 
+def _record_same_syndrome_both_labels(
+    table_syn: pa.Table,
+    checks: dict[str, dict[str, Any]],
+) -> None:
+    """Brief: check "the valid case where one syndrome occurs with both labels"."""
+    labels_by_syndrome: dict[tuple[str, bytes], set[bool]] = {}
+    for experiment_id, bits, label in zip(
+        table_syn.column("experiment_id").to_pylist(),
+        table_syn.column("syndrome_bits").to_pylist(),
+        table_syn.column("logical_error_label").to_pylist(),
+    ):
+        labels_by_syndrome.setdefault((experiment_id, bits), set()).add(label)
+    both = sum(1 for labels in labels_by_syndrome.values() if len(labels) == 2)
+    _record_check(
+        checks,
+        "RULE_SYN_SAME_SYNDROME_BOTH_LABELS",
+        checked=len(labels_by_syndrome),
+        observation=f"{both} syndromes occur with both labels within one file; all rows kept",
+    )
+
+
 def _execute_run(
     run_id: str,
     settings: Settings | None,
@@ -1438,6 +1652,7 @@ def _execute_run(
 
     issues: list[dict[str, Any]] = []
     run_state["issues"] = issues
+    checks: dict[str, dict[str, Any]] = {}
     total_inputs = 0
     total_outputs = 0
 
@@ -1448,8 +1663,9 @@ def _execute_run(
     syn_bytes, syn_sha = get_bronze_archive(syn_obj, settings, base_dir)
     run_state["input_hashes"][syn_obj] = syn_sha
     table_syn, trace_syn, in_syn = prepare_syndrome_observations(
-        syn_bytes, syn_obj, syn_sha, run_id, issues
+        syn_bytes, syn_obj, syn_sha, run_id, issues, checks
     )
+    _record_same_syndrome_both_labels(table_syn, checks)
     total_inputs += in_syn
     total_outputs += table_syn.num_rows
 
@@ -1470,8 +1686,13 @@ def _execute_run(
     google_bytes, google_sha = get_bronze_archive(google_obj, settings, base_dir)
     run_state["input_hashes"][google_obj] = google_sha
     table_exp, trace_exp, in_exp = prepare_google_experiments(
-        google_bytes, google_obj, google_sha, run_id, issues
+        google_bytes, google_obj, google_sha, run_id, issues, checks
     )
+    accepted_experiments = set(table_exp.column("experiment_id").to_pylist())
+    excluded_experiments = {
+        record_id.split(":")[1]
+        for record_id in trace_exp["source_record_id"]
+    } - accepted_experiments
     total_inputs += in_exp
     total_outputs += table_exp.num_rows
 
@@ -1489,7 +1710,7 @@ def _execute_run(
     # 3. Process Google QEC Shots
     # --------------------------------------------------------------------------
     table_shot, trace_shot, in_shot = prepare_google_shots(
-        google_bytes, google_obj, google_sha, run_id, issues
+        google_bytes, google_obj, google_sha, run_id, issues, checks, excluded_experiments
     )
     total_inputs += in_shot
     total_outputs += table_shot.num_rows
@@ -1525,6 +1746,14 @@ def _execute_run(
     qasm_tables, trace_qasm, qasm_row_counts = prepare_qasmbench(
         qasm_bytes, qasm_obj, qasm_sha, run_id, base_dir, issues
     )
+    # QASMBench rules are evaluated once per .qasm file in each table builder.
+    _record_check(checks, "RULE_QASM_ARCHIVE_UNAVAILABLE")
+    for rule_id, table_name in [
+        ("RULE_QASM_CIRCUIT_PARSE", "circuit"),
+        ("RULE_QASM_STABILIZER_PARSE", "stabilizer_check"),
+        ("RULE_QASM_CORRECTION_PARSE", "conditional_correction"),
+    ]:
+        _record_check(checks, rule_id, checked=qasm_row_counts[table_name]["rows_read"])
     total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
         q_dir = silver_base / "qasmbench"
@@ -1607,24 +1836,14 @@ def _execute_run(
     result.issue_count = len(issues)
     result.finish()
 
+    check_outcomes = _check_outcomes(checks, issues)
     row_counts_path = results_base / "row_counts.json"
-    run_path = results_base / "run.json"
+    check_outcomes_path = results_base / "check_outcomes.json"
     _write_json(row_counts_path, {"run_id": run_id, "tables": row_counts})
-    _write_json(run_path, {
-        "run_id": run_id,
-        "stage": "prepare_data",
-        "status": "succeeded",
-        "input_hashes": {
-            syn_obj: syn_sha,
-            google_obj: google_sha,
-            qasm_obj: qasm_sha,
-        },
-        "git_revision": _git_revision(base_dir),
-        "started_at": result.started_at.isoformat(),
-        "ended_at": result.finished_at.isoformat(),
-        "issue_count": result.issue_count,
-        "output_table_counts": output_table_counts,
-    })
+    _write_json(check_outcomes_path, {"run_id": run_id, "checks": check_outcomes})
+    # run.json is written once per run by the CLI from these details.
+    result.details["output_table_counts"] = output_table_counts
+    result.details["checks"] = check_outcomes
 
     # --------------------------------------------------------------------------
     # 7. Upload to MinIO (if configured)
@@ -1639,7 +1858,7 @@ def _execute_run(
                 client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
             client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
-            client.fput_object(settings.s3_bucket, "results/part1/run.json", str(run_path))
+            client.fput_object(settings.s3_bucket, "results/part1/check_outcomes.json", str(check_outcomes_path))
         except Exception:
             logging.exception("MinIO upload failed during prepare_data run %s", run_id)
             raise

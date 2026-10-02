@@ -30,16 +30,14 @@ def test_failed_prepare_run_records_failure_and_reraises(tmp_path, monkeypatch):
         prepare_data.run("failed-run")
 
     results_dir = tmp_path / "results/part1"
-    run_data = json.loads((results_dir / "run.json").read_text(encoding="utf-8"))
     row_counts = json.loads((results_dir / "row_counts.json").read_text(encoding="utf-8"))
     issues = pq.read_table(results_dir / "data_issues.parquet").to_pylist()
 
-    assert run_data["status"] == "failed"
-    assert run_data["error"]["type"] == "ValueError"
-    assert run_data["error"]["message"] == "synthetic stage failure"
-    assert run_data["issue_count"] == 1
+    # run.json is written by the CLI for the whole run, not by this stage.
+    assert not (results_dir / "run.json").exists()
     assert row_counts["tables"]["results/part1/data_issues.parquet"]["rows_loaded"] == 1
     assert issues[0]["rule_id"] == "RUN_PREPARE_DATA_FAILED"
+    assert issues[0]["observed_value"] == "ValueError: synthetic stage failure"
 
 
 def _syndrome_archive(rows):
@@ -259,18 +257,21 @@ def test_google_shot_rejects_misaligned_01_records():
     ]
 
 
-def test_google_shot_reports_missing_companion_file():
+def test_google_shot_missing_companion_file_stops_run():
     archive_bytes = _google_shot_archive(
         omitted=("obs_flips_predicted_by_pymatching.01",),
     )
+    issues = []
 
-    table, rows_read, issues = _parse_google_shots(archive_bytes)
+    with pytest.raises(prepare_data.MissingCompanionFileError):
+        prepare_data.prepare_google_shots(
+            archive_bytes, "google_qec.zip", "input-hash", "test-run", issues
+        )
 
-    assert rows_read == 1
-    assert table.num_rows == 0
     assert [issue["rule_id"] for issue in issues] == [
         "RULE_GOOGLE_MISSING_COMPANION"
     ]
+    assert issues[0]["action"] == "stopped run"
 
 
 def test_prepare_data_stage_execution():
@@ -288,21 +289,22 @@ def test_prepare_data_stage_execution():
     silver_dir = base_dir / "silver"
     results_dir = base_dir / "results/part1"
 
-    run_file = results_dir / "run.json"
     row_counts_file = results_dir / "row_counts.json"
-    assert run_file.exists(), "run.json missing"
     assert row_counts_file.exists(), "row_counts.json missing"
-    run_data = json.loads(run_file.read_text(encoding="utf-8"))
     row_count_data = json.loads(row_counts_file.read_text(encoding="utf-8"))
-    assert run_data["run_id"] == "test_verification_run"
-    assert run_data["input_hashes"]
-    #assert run_data["git_revision"]
-    assert run_data["started_at"]
-    assert run_data["ended_at"]
-    assert run_data["output_table_counts"]
+    output_table_counts = res.details["output_table_counts"]
+    assert output_table_counts
     for table_path, counts in row_count_data["tables"].items():
         assert counts["rows_read"] == counts["rows_accepted"] + counts["rows_rejected"]
-        assert counts["rows_loaded"] == run_data["output_table_counts"][table_path]
+        assert counts["rows_loaded"] == output_table_counts[table_path]
+
+    # Outcome of every check: all rules evaluated, none failed on this release.
+    outcomes = {check["rule_id"]: check for check in res.details["checks"]}
+    assert set(outcomes) == set(prepare_data.CHECK_CATALOG)
+    assert all(check["failed"] == 0 for check in outcomes.values())
+    assert outcomes["RULE_SYN_WEIGHTED_TOTAL"]["checked"] == 7
+    assert outcomes["RULE_GOOGLE_PADDING_BITS"]["checked"] == 250000
+    assert outcomes["RULE_SYN_HEADER_DOCUMENTED"]["outcome"] == "observed"
 
     # 1. Syndrome observations contract & invariants
     syn_file = silver_dir / "qec_syndromes/syndrome_observation.parquet"
