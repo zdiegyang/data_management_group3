@@ -9,7 +9,6 @@
 -- -- DROP/CREATE back too -- a failed run leaves the previous Gold schema intact.
 -- DROP SCHEMA IF EXISTS gold CASCADE;
 -- CREATE SCHEMA gold;
---
 -- -- =============================================================================
 -- -- qec_syndromes: one simulated fault-rate experiment and its aggregated rows.
 -- -- =============================================================================
