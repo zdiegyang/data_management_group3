@@ -7,6 +7,7 @@ deliverable. Repeated loads must not create duplicate records.
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -15,6 +16,7 @@ import psycopg
 import pyarrow.parquet as pq
 
 from quantum_lake_student.config import Settings
+from quantum_lake_student.connections import minio_client
 from quantum_lake_student.models import StageResult
 
 PROJECT = Path(__file__).resolve().parents[3]
@@ -30,7 +32,17 @@ DECODER_NAMES = [
 ]
 
 
-def _rows(path: Path) -> list[dict[str, Any]]:
+def _rows(path: Path, silver_key:str) -> list[dict[str, Any]]:
+    settings = Settings.from_environment()
+    if settings.lake_backend == "minio":
+        client = minio_client(settings)
+        response = client.get_object(settings.s3_bucket, silver_key)
+        try:
+            table = pq.read_table(io.BytesIO(response.read()))
+        finally:
+            response.close()
+            response.release_conn()
+        return table.to_pylist()
     return pq.read_table(path).to_pylist()
 
 
@@ -89,6 +101,11 @@ def _copy_load(
             copy.write_row(tuple(row[c] for c in columns))
     return len(rows)
 
+def _distance_from_experiment_id(experiment_id: str) -> int:
+    """Parse the "d-3" segment of e.g. "d-3_pfr-0.000500_nb-10M" -> 3."""
+    first = experiment_id.split("_")[0]
+    return int(first.split("-")[1])
+
 
 def run(run_id: str) -> StageResult:
     settings = Settings.from_environment()
@@ -101,20 +118,37 @@ def run(run_id: str) -> StageResult:
             conn.execute((SQL_DIR / "gold_schema.sql").read_text())
 
             # ---- qec_syndromes ------------------------------------------------
-            syn_rows = _rows(SILVER / "qec_syndromes/syndrome_observation.parquet")
+            syn_rows = _rows(SILVER / "qec_syndromes/syndrome_observation.parquet", "silver/qec_syndromes/syndrome_observation.parquet")
             experiments = {
                 r["experiment_id"]: {
                     "experiment_id": r["experiment_id"],
                     "physical_fault_rate": r["physical_fault_rate"],
-                    "round_count": r["round_count"],
+                    "distance": _distance_from_experiment_id(r["experiment_id"]),
+                    "rounds": r["round_count"],
                     "check_count": r["check_count"],
                 }
                 for r in syn_rows
             }
             counts["sim_experiment"] = _copy_load(
                 conn, "gold.sim_experiment",
-                ["experiment_id", "physical_fault_rate", "round_count", "check_count"],
+                ["experiment_id", "physical_fault_rate", "distance", "rounds", "check_count"],
                 experiments.values(),
+            )
+
+            # dedup syndrome patterns across ALL rows/experiments.
+            patterns = {
+                r["syndrome_bits"]: {
+                    "syndrome_bits": r["syndrome_bits"],
+                    "round_count": r["round_count"],
+                    "check_count": r["check_count"],
+                    "hamming_weight": sum(r["syndrome_bits"]),
+                }
+                for r in syn_rows
+            }
+            counts["syndrome_pattern"] = _copy_load(
+                conn, "gold.syndrome_pattern",
+                ["syndrome_bits", "round_count", "check_count", "hamming_weight"],
+                patterns.values(),
             )
             counts["syndrome_observation"] = _copy_load(
                 conn, "gold.syndrome_observation",
@@ -124,7 +158,7 @@ def run(run_id: str) -> StageResult:
             )
 
             # ---- google_qec -----------------------------------------------------
-            exp_rows = _rows(SILVER / "google_qec/experiment.parquet")
+            exp_rows = _rows(SILVER / "google_qec/experiment.parquet", "silver/google_qec/experiment.parquet")
             counts["google_experiment"] = _copy_load(
                 conn, "gold.google_experiment",
                 ["experiment_id", "source_record_id", "basis", "distance", "rounds",
@@ -132,7 +166,7 @@ def run(run_id: str) -> StageResult:
                 exp_rows,
             )
 
-            shot_rows = _rows(SILVER / "google_qec/shot.parquet")
+            shot_rows = _rows(SILVER / "google_qec/shot.parquet", "silver/google_qec/shot.parquet")
             counts["google_shot"] = _copy_load(
                 conn, "gold.google_shot",
                 ["source_record_id", "experiment_id", "shot_index", "measurement_bits",
@@ -141,6 +175,10 @@ def run(run_id: str) -> StageResult:
                 shot_rows,
             )
 
+            counts["decoder"] = _copy_load(
+                conn, "gold.decoder", ["decoder_name"],
+                ({"decoder_name": d} for d in DECODER_NAMES),
+            )
             prediction_rows = [
                 {
                     "shot_source_record_id": r["source_record_id"],
@@ -157,7 +195,10 @@ def run(run_id: str) -> StageResult:
             )
 
             # ---- qasmbench -------------------------------------------------------
-            circuit_rows = _rows(SILVER / "qasmbench/circuit.parquet")
+            circuit_rows = _rows(SILVER / "qasmbench/circuit.parquet", "silver/qasmbench/circuit.parquet")
+            benchmarks = {r["benchmark_name"]: {"benchmark_name": r["benchmark_name"]} for r in circuit_rows}
+            counts["benchmark"] = _copy_load(conn, "gold.benchmark", ["benchmark_name"], benchmarks.values())
+
             counts["circuit"] = _copy_load(
                 conn, "gold.circuit",
                 ["circuit_id", "source_record_id", "benchmark_name", "variant",
@@ -165,14 +206,25 @@ def run(run_id: str) -> StageResult:
                  "two_qubit_gate_count"],
                 circuit_rows,
             )
-            sc_rows = _rows(SILVER / "qasmbench/stabilizer_check.parquet")
+
+            sc_rows = _rows(SILVER / "qasmbench/stabilizer_check.parquet", "silver/qasmbench/stabilizer_check.parquet")
             counts["stabilizer_check"] = _copy_load(
                 conn, "gold.stabilizer_check",
-                ["source_record_id", "circuit_id", "check_id", "ancilla_qubit",
-                 "data_qubits", "syndrome_bit"],
+                ["source_record_id", "circuit_id", "check_id", "ancilla_qubit", "syndrome_bit"],
                 sc_rows,
             )
-            cc_rows = _rows(SILVER / "qasmbench/conditional_correction.parquet")
+            check_data_qubit_rows = [
+                {"check_source_record_id": r["source_record_id"], "position": i, "data_qubit": q}
+                for r in sc_rows
+                for i, q in enumerate(r["data_qubits"])
+            ]
+            counts["check_data_qubit"] = _copy_load(
+                conn, "gold.check_data_qubit",
+                ["check_source_record_id", "position", "data_qubit"],
+                check_data_qubit_rows,
+            )
+
+            cc_rows = _rows(SILVER / "qasmbench/conditional_correction.parquet", "silver/qasmbench/conditional_correction.parquet")
             counts["conditional_correction"] = _copy_load(
                 conn, "gold.conditional_correction",
                 ["source_record_id", "circuit_id", "condition_register",
