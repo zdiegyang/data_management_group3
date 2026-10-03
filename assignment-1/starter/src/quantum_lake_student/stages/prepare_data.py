@@ -390,6 +390,7 @@ QASMBENCH_CIRCUIT_SCHEMA = pa.schema([
     ("variant", pa.string()),
     ("register_declarations", pa.string()),
     ("qubit_count", pa.int32()),
+    ("operation_count", pa.int32()),
     ("measurement_count", pa.int32()),
     ("two_qubit_gate_count", pa.int32()),
 ])
@@ -1089,10 +1090,8 @@ def prepare_qasmbench(
     base_dir: Path,
     issues: list[dict[str, Any]],
 ) -> tuple[dict[str, pa.Table], dict[str, list[Any]], dict[str, dict[str, int | str]]]:
-    """Hook for QASMBench circuits, stabilizer checks, and conditional corrections.
-
-    If pre-existing silver/qasmbench parquet tables exist on disk (e.g. from Diego's notebooks),
-    this hook loads and preserves them seamlessly.
+    """
+    Produces the tables from the QASMBench sources. 
     """
     silver_qasm_tables: dict[str, pa.Table] = {}
     trace_cols: dict[str, list[Any]] = {
@@ -1129,15 +1128,23 @@ def prepare_qasmbench(
         "stabilizer_check": (sc_rows_read, sc_rows_rejected),
         "conditional_correction": (cc_rows_read, cc_rows_rejected),
     }
-    row_counts = {
-        name: _row_counts(
-            rows_read,
-            rows_read - rows_rejected,
-            silver_qasm_tables[name].num_rows,
-            "QASM archive member",
-        )
-        for name, (rows_read, rows_rejected) in source_counts.items()
+    row_units = {
+        "circuit": "circuit row",
+        "stabilizer_check": "stabilizer check row",
+        "conditional_correction": "conditional correction row",
     }
+    row_counts = {}
+    for name, table in silver_qasm_tables.items():
+        source_files_read, source_files_rejected = source_counts[name]
+        child_rows = table.num_rows
+        row_counts[name] = _row_counts(
+            child_rows,
+            child_rows,
+            child_rows,
+            row_units[name],
+        )
+        row_counts[name]["source_files_read"] = source_files_read
+        row_counts[name]["source_files_rejected"] = source_files_rejected
     
     return silver_qasm_tables, trace_cols, row_counts
 
@@ -1271,7 +1278,7 @@ def _create_qasmbench_stabilizer_checks_table(bronze_bytes, bronze_object_name, 
                 trace_cols["source_name"].append("qasmbench")
                 trace_cols["bronze_object"].append(bronze_object_name)
                 trace_cols["archive_member"].append(member)
-                trace_cols["record_locator"].append(rec["check_id"])
+                trace_cols["record_locator"].append(rec["record_locator"])
                 trace_cols["input_sha256"].append(input_sha256)
                 trace_cols["valid"].append("yes")
 
@@ -1379,6 +1386,17 @@ def _body_two_qubit_count(body):
             count += 1
     return count
 
+
+def _body_operation_count(body):
+    count = 0
+    for statement in body.split(";"):
+        statement = " ".join(statement.split())
+        if not statement or statement.startswith(("OPENQASM", "include", "barrier", "opaque", "measure")):
+            continue
+        if len(statement.split(None, 1)) == 2:
+            count += 1
+    return count
+
 def _parse_circuit(member, text):
     cleaned = re.sub(r"//.*", "", text)
     gate_definitions = {}
@@ -1386,6 +1404,7 @@ def _parse_circuit(member, text):
         gate_definitions[match.group(1)] = {
             "formal_count": len([item for item in match.group(2).split(",") if item.strip()]),
             "two_qubit_count": _body_two_qubit_count(match.group("body")),
+            "operation_count": _body_operation_count(match.group("body")),
         }
     executable_text = GATE_HEADER.sub("", cleaned)
 
@@ -1393,6 +1412,7 @@ def _parse_circuit(member, text):
     qreg_sizes = {}
     register_lines = []
     measurement_count = 0
+    operation_count = 0
     two_qubit_gate_count = 0
     for statement in executable_text.replace("{", " ").replace("}", " ").split(";"):
         statement = " ".join(statement.split())
@@ -1419,12 +1439,17 @@ def _parse_circuit(member, text):
         operands = [item.strip() for item in operand_text.split(",")]
         gate_key = gate_name.lower()
         if gate_key in TWO_QUBIT_GATES:
-            two_qubit_gate_count += _expanded_operation_count(operands, registers)
+            expanded_count = _expanded_operation_count(operands, registers)
+            operation_count += expanded_count
+            two_qubit_gate_count += expanded_count
         elif gate_name in gate_definitions:
             widths = [_operand_width(item, registers) for item in operands]
             assert len(widths) == gate_definitions[gate_name]["formal_count"]
             assert len(set(widths)) == 1, f"Custom gate widths do not align: {statement}"
+            operation_count += gate_definitions[gate_name]["operation_count"] * widths[0]
             two_qubit_gate_count += gate_definitions[gate_name]["two_qubit_count"] * widths[0]
+        else:
+            operation_count += _expanded_operation_count(operands, registers)
 
     benchmark_name = Path(member).parent.name
     filename = Path(member).stem
@@ -1436,6 +1461,7 @@ def _parse_circuit(member, text):
         "variant": variant,
         "register_declarations": "; ".join(register_lines),
         "qubit_count": sum(qreg_sizes.values()),
+        "operation_count": operation_count,
         "measurement_count": measurement_count,
         "two_qubit_gate_count": two_qubit_gate_count,
     }
@@ -1481,11 +1507,21 @@ def _expand_pairs(left, right, registers):
     assert len(left_values) == len(right_values), f"CNOT registers do not align: {left}, {right}"
     return list(zip(left_values, right_values))
 
+
+def _mask_gate_definitions(text):
+    return GATE_HEADER.sub(
+        lambda match: "".join(
+            char if char in "\r\n;" else " " for char in match.group(0)
+        ),
+        text,
+    )
+
 def _parse_stabilizer_checks(member, text):
     cleaned = re.sub(r"//.*", "", text)
     registers = _parse_registers(cleaned)
     measurement_map = {}
-    for statement in cleaned.split(";"):
+    measurement_statement_map = {}
+    for statement_index, statement in enumerate(cleaned.split(";")):
         statement = " ".join(statement.split())
         if not statement.startswith("measure "):
             continue
@@ -1494,21 +1530,36 @@ def _parse_stabilizer_checks(member, text):
         destination_values = _expand_operand(destination, registers)
         assert len(measured_values) == len(destination_values)
         measurement_map.update(zip(measured_values, destination_values))
+        measurement_statement_map.update(
+            (qubit, statement_index) for qubit in measured_values
+        )
 
     gate_definitions = {}
     for match in GATE_HEADER.finditer(cleaned):
         formal_names = [item.strip() for item in match.group(2).split(",") if item.strip()]
         body_pairs = []
-        for statement in match.group("body").split(";"):
-            statement = " ".join(statement.split())
+        body_offset = match.start("body")
+        current_offset = 0
+        body = match.group("body")
+        for raw_statement in body.split(";"):
+            leading_whitespace = len(raw_statement) - len(raw_statement.lstrip())
+            statement = " ".join(raw_statement.split())
             body_match = CNOT_STATEMENT.fullmatch(statement)
             if body_match:
-                body_pairs.append((body_match.group(1).strip(), body_match.group(2).strip()))
+                body_statement_index = cleaned.count(
+                    ";", 0, body_offset + current_offset + leading_whitespace
+                )
+                body_pairs.append((
+                    body_match.group(1).strip(),
+                    body_match.group(2).strip(),
+                    body_statement_index,
+                ))
+            current_offset += len(raw_statement) + 1
         gate_definitions[match.group(1)] = (formal_names, body_pairs)
 
-    executable_text = GATE_HEADER.sub("", cleaned)
+    executable_text = _mask_gate_definitions(cleaned)
     interactions = []
-    for statement in executable_text.split(";"):
+    for statement_index, statement in enumerate(executable_text.split(";")):
         statement = " ".join(statement.split())
         if not statement or statement.startswith(("OPENQASM", "include", "barrier", "opaque", "measure", "qreg", "creg")):
             continue
@@ -1518,20 +1569,30 @@ def _parse_stabilizer_checks(member, text):
         operation, operand_text = tokens
         if operation.lower() == "cx":
             left, right = [part.strip() for part in operand_text.split(",", 1)]
-            interactions.extend(_expand_pairs(left, right, registers))
+            interactions.extend(
+                (data_qubit, ancilla_qubit, {statement_index})
+                for data_qubit, ancilla_qubit in _expand_pairs(left, right, registers)
+            )
         elif operation in gate_definitions:
             formal_names, body_pairs = gate_definitions[operation]
             actual_operands = [part.strip() for part in operand_text.split(",")]
             assert len(formal_names) == len(actual_operands), f"Custom gate arguments do not align: {statement}"
             substitutions = dict(zip(formal_names, actual_operands))
-            for left, right in body_pairs:
+            for left, right, definition_statement_index in body_pairs:
                 mapped_left = substitutions[left]
                 mapped_right = substitutions[right]
-                interactions.extend(_expand_pairs(mapped_left, mapped_right, registers))
+                interactions.extend(
+                    (data_qubit, ancilla_qubit, {statement_index, definition_statement_index})
+                    for data_qubit, ancilla_qubit in _expand_pairs(
+                        mapped_left, mapped_right, registers
+                    )
+                )
 
     by_ancilla = {}
-    for data_qubit, ancilla_qubit in interactions:
+    statement_indices_by_ancilla = {}
+    for data_qubit, ancilla_qubit, statement_indices in interactions:
         by_ancilla.setdefault(ancilla_qubit, set()).add(data_qubit)
+        statement_indices_by_ancilla.setdefault(ancilla_qubit, set()).update(statement_indices)
 
     benchmark_name = Path(member).parent.name
     variant = "transpiled" if Path(member).stem.endswith("_transpiled") else "source"
@@ -1542,6 +1603,8 @@ def _parse_stabilizer_checks(member, text):
         syndrome_bit = measurement_map.get(ancilla_qubit)
         if len(data_qubits) < 2 or syndrome_bit is None:
             continue
+        statement_indices = statement_indices_by_ancilla[ancilla_qubit]
+        statement_indices.add(measurement_statement_map[ancilla_qubit])
         check_id = f"{circuit_id}:check:{check_number}"
         records.append({
             "source_record_id": f"qasmbench:{member}:check:{check_number}",
@@ -1550,6 +1613,9 @@ def _parse_stabilizer_checks(member, text):
             "ancilla_qubit": ancilla_qubit,
             "data_qubits": data_qubits,
             "syndrome_bit": syndrome_bit,
+            "record_locator": "statements:" + ",".join(
+                str(index) for index in sorted(statement_indices)
+            ),
         })
     return records
 
@@ -1753,7 +1819,7 @@ def _execute_run(
         ("RULE_QASM_STABILIZER_PARSE", "stabilizer_check"),
         ("RULE_QASM_CORRECTION_PARSE", "conditional_correction"),
     ]:
-        _record_check(checks, rule_id, checked=qasm_row_counts[table_name]["rows_read"])
+        _record_check(checks, rule_id, checked=qasm_row_counts[table_name]["source_files_read"])
     total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
         q_dir = silver_base / "qasmbench"

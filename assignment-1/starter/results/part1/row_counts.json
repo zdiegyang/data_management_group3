@@ -1,14 +1,54 @@
 {
-  "run_id": "run_20261002_124315",
+  "run_id": "run_20261003_150753",
   "silver_to_gold": {
-    "circuit": 6,
-    "conditional_correction": 6,
-    "decoder_prediction": 1000000,
-    "google_experiment": 5,
-    "google_shot": 250000,
-    "sim_experiment": 7,
-    "stabilizer_check": 8,
-    "syndrome_observation": 75598
+    "circuit": {
+      "expected_from": "circuit Silver rows",
+      "expected_silver_count": 6,
+      "loaded_count": 6,
+      "matches": true
+    },
+    "conditional_correction": {
+      "expected_from": "conditional_correction Silver rows",
+      "expected_silver_count": 6,
+      "loaded_count": 6,
+      "matches": true
+    },
+    "decoder_prediction": {
+      "expected_from": "4 decoder rows per shot Silver row",
+      "expected_silver_count": 1000000,
+      "loaded_count": 1000000,
+      "matches": true
+    },
+    "google_experiment": {
+      "expected_from": "experiment Silver rows",
+      "expected_silver_count": 5,
+      "loaded_count": 5,
+      "matches": true
+    },
+    "google_shot": {
+      "expected_from": "shot Silver rows",
+      "expected_silver_count": 250000,
+      "loaded_count": 250000,
+      "matches": true
+    },
+    "sim_experiment": {
+      "expected_from": "distinct experiment_id values in syndrome_observation Silver",
+      "expected_silver_count": 7,
+      "loaded_count": 7,
+      "matches": true
+    },
+    "stabilizer_check": {
+      "expected_from": "stabilizer_check Silver rows",
+      "expected_silver_count": 8,
+      "loaded_count": 8,
+      "matches": true
+    },
+    "syndrome_observation": {
+      "expected_from": "syndrome_observation Silver rows",
+      "expected_silver_count": 75598,
+      "loaded_count": 75598,
+      "matches": true
+    }
   },
   "tables": {
     "results/part1/data_issues.parquet": {
@@ -44,21 +84,27 @@
       "rows_loaded": 6,
       "rows_read": 6,
       "rows_rejected": 0,
-      "unit": "QASM archive member"
+      "source_files_read": 6,
+      "source_files_rejected": 0,
+      "unit": "circuit row"
     },
     "silver/qasmbench/conditional_correction.parquet": {
       "rows_accepted": 6,
       "rows_loaded": 6,
       "rows_read": 6,
       "rows_rejected": 0,
-      "unit": "QASM archive member"
+      "source_files_read": 6,
+      "source_files_rejected": 0,
+      "unit": "conditional correction row"
     },
     "silver/qasmbench/stabilizer_check.parquet": {
-      "rows_accepted": 6,
+      "rows_accepted": 8,
       "rows_loaded": 8,
-      "rows_read": 6,
+      "rows_read": 8,
       "rows_rejected": 0,
-      "unit": "QASM archive member"
+      "source_files_read": 6,
+      "source_files_rejected": 0,
+      "unit": "stabilizer check row"
     },
     "silver/qec_syndromes/syndrome_observation.parquet": {
       "rows_accepted": 75598,

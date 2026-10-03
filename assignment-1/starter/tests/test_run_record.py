@@ -27,7 +27,13 @@ def _silver():
 
 
 def test_run_record_combines_all_stages(tmp_path):
-    (tmp_path / "row_counts.json").write_text(json.dumps({"silver_to_gold": {"google_shot": 7}}))
+    (tmp_path / "row_counts.json").write_text(json.dumps({"silver_to_gold": {
+        "google_shot": {
+            "expected_silver_count": 7,
+            "loaded_count": 7,
+            "matches": True,
+        },
+    }}))
     stages = [_bronze(), _silver(), _finished("load_postgres", output_count=7)]
 
     cli.write_run_record("run-1", datetime.now(UTC), stages, results_dir=tmp_path)
@@ -45,7 +51,13 @@ def test_run_record_combines_all_stages(tmp_path):
 
 
 def test_failed_run_is_recorded_without_later_stage_outputs(tmp_path):
-    (tmp_path / "row_counts.json").write_text(json.dumps({"silver_to_gold": {"google_shot": 7}}))
+    (tmp_path / "row_counts.json").write_text(json.dumps({"silver_to_gold": {
+        "google_shot": {
+            "expected_silver_count": 7,
+            "loaded_count": 7,
+            "matches": True,
+        },
+    }}))
 
     cli.write_run_record(
         "run-1", datetime.now(UTC), [_bronze()],

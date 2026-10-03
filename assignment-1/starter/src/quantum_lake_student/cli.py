@@ -117,8 +117,13 @@ def write_run_record(
     output_table_counts = dict(details.get("prepare_data", {}).get("output_table_counts", {}))
     if "load_postgres" in details:
         gold_counts = _read_json(results_dir / "row_counts.json").get("silver_to_gold", {})
-        for table, count in gold_counts.items():
-            output_table_counts[f"gold.{table}"] = count
+        for table, comparison in gold_counts.items():
+            loaded_count = (
+                comparison.get("loaded_count")
+                if isinstance(comparison, dict)
+                else comparison
+            )
+            output_table_counts[f"gold.{table}"] = loaded_count
 
     record: dict[str, Any] = {
         "run_id": run_id,

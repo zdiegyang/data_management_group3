@@ -297,6 +297,18 @@ def test_prepare_data_stage_execution():
     for table_path, counts in row_count_data["tables"].items():
         assert counts["rows_read"] == counts["rows_accepted"] + counts["rows_rejected"]
         assert counts["rows_loaded"] == output_table_counts[table_path]
+    qasm_row_units = {
+        "circuit": "circuit row",
+        "stabilizer_check": "stabilizer check row",
+        "conditional_correction": "conditional correction row",
+    }
+    for table_name, unit in qasm_row_units.items():
+        table_path = f"silver/qasmbench/{table_name}.parquet"
+        counts = row_count_data["tables"][table_path]
+        assert counts["unit"] == unit
+        assert counts["rows_read"] == counts["rows_loaded"]
+        assert counts["source_files_read"] >= counts["source_files_rejected"]
+        assert counts["rows_loaded"] == pq.read_table(silver_dir / "qasmbench" / f"{table_name}.parquet").num_rows
 
     # Outcome of every check: all rules evaluated, none failed on this release.
     outcomes = {check["rule_id"]: check for check in res.details["checks"]}
