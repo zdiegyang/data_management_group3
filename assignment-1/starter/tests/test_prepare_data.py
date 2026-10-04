@@ -183,7 +183,75 @@ def test_syndrome_rows_with_same_bits_and_different_labels_are_kept():
     assert len(set(table.column("source_record_id").to_pylist())) == 2
 
 
+def test_invalid_syndrome_shape_is_excluded_and_traced():
+    archive_bytes = _syndrome_archive([
+        ("0", "[[0, 1], [0, 1]]", "1"),
+    ])
+    issues = []
+    checks = {}
 
+    table, trace_cols, input_count = prepare_data.prepare_syndrome_observations(
+        archive_bytes,
+        "syndromes.zip",
+        "input-hash",
+        "run-1",
+        issues,
+        checks,
+    )
+
+    assert input_count == 1
+    assert table.num_rows == 0
+
+    assert any(
+        issue["rule_id"] == "RULE_SYN_SHAPE_DOMAIN"
+        and issue["action"] == "excluded"
+        for issue in issues
+    )
+
+    assert trace_cols["source_record_id"] == [
+        "qec_syndromes:d-3_pfr-0.001000_nb-10M.csv:row:0"
+    ]
+    assert trace_cols["valid"] == ["no"]
+
+    assert checks["RULE_SYN_SHAPE_DOMAIN"]["failed"] == 1
+
+def test_non_positive_quantity_is_excluded_and_traced():
+    archive_bytes = _syndrome_archive([
+        (
+            "0",
+            "[[0, 1, 0, 1], [0, 1, 0, 1], [0, 1, 0, 1], [0, 1, 0, 1]]",
+            "0",
+        ),
+    ])
+    issues = []
+    checks = {}
+
+    table, trace_cols, input_count = prepare_data.prepare_syndrome_observations(
+        archive_bytes,
+        "syndromes.zip",
+        "input-hash",
+        "run-1",
+        issues,
+        checks,
+    )
+
+    assert input_count == 1
+    assert table.num_rows == 0
+
+    assert any(
+        issue["rule_id"] == "RULE_SYN_QUANTITY_POSITIVE"
+        and issue["action"] == "excluded"
+        for issue in issues
+    )
+
+    assert trace_cols["source_record_id"] == [
+        "qec_syndromes:d-3_pfr-0.001000_nb-10M.csv:row:0"
+    ]
+
+    assert trace_cols["valid"] == ["no"]
+
+    assert checks["RULE_SYN_QUANTITY_POSITIVE"]["failed"] == 1
+    
 def test_google_shot_b8_records_preserve_little_endian_order_and_padding():
     archive_bytes = _google_shot_archive(
         shots=2,
@@ -416,7 +484,7 @@ def test_prepare_data_stage_execution():
     assert t_trace.schema == SOURCE_TRACE_SCHEMA
     df_trace = t_trace.to_pandas()
     assert set(df_trace["valid"].unique()) == {"yes"}
-    assert df_trace["source_record_id"].nunique() in (325603, 325623)
+    assert df_trace["source_record_id"].nunique() == 325623
 
     # Composite primary key uniqueness in trace table
     assert not df_trace.duplicated(
