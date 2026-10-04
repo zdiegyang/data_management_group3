@@ -245,9 +245,9 @@
       "unit": "QASM file"
     }
   ],
-  "code_sha256": "8d6653c01f65e3ae547787c3249a70f35d4b39b96bcc196a7a12f1bd3b153961",
-  "ended_at": "2026-10-03T15:09:32.772443+00:00",
-  "git_revision": "a5d8f2c738b008b762749ca326840f54ce5d0675",
+  "code_sha256": "019f4af19c1cfd77b6e0db8ba23cc77f4fdc140c81be3ec19b0fc0951d8b7d6b",
+  "ended_at": "2026-10-04T12:37:50.009967+00:00",
+  "git_revision": null,
   "input_hashes": {
     "bronze/source=google_qec/google-surface-code-curated.zip": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
     "bronze/source=qasmbench/qasmbench-qec.zip": "60307f88e34b1f752b94223d6d136da72c629b4b625ac6d1c30e5e2e4f85722a",
@@ -272,41 +272,49 @@
     "silver/qasmbench/stabilizer_check.parquet": 8,
     "silver/qec_syndromes/syndrome_observation.parquet": 75598
   },
-  "run_id": "run_20261003_150753",
+  "run_id": "run_20261004_123602",
   "stages": [
     {
-      "ended_at": "2026-10-03T15:07:53.491131+00:00",
+      "ended_at": "2026-10-04T12:36:02.765348+00:00",
       "input_count": 3,
       "issue_count": 0,
       "output_count": 3,
       "stage": "register_sources",
-      "started_at": "2026-10-03T15:07:53.376671+00:00"
+      "started_at": "2026-10-04T12:36:02.669005+00:00"
     },
     {
-      "ended_at": "2026-10-03T15:08:05.330563+00:00",
+      "ended_at": "2026-10-04T12:36:16.219204+00:00",
       "input_count": 325623,
       "issue_count": 0,
       "output_count": 325623,
       "stage": "prepare_data",
-      "started_at": "2026-10-03T15:07:53.492413+00:00"
+      "started_at": "2026-10-04T12:36:02.767928+00:00"
     },
     {
-      "ended_at": "2026-10-03T15:09:07.037801+00:00",
-      "input_count": 325623,
-      "issue_count": 0,
-      "output_count": 1325630,
-      "stage": "load_postgres",
-      "started_at": "2026-10-03T15:08:06.152327+00:00"
-    },
-    {
-      "ended_at": "2026-10-03T15:09:32.768551+00:00",
+      "ended_at": "2026-10-04T12:36:41.949033+00:00",
       "input_count": 250000,
       "issue_count": 0,
       "output_count": 1,
       "stage": "measure_detector_storage",
-      "started_at": "2026-10-03T15:09:07.285757+00:00"
+      "started_at": "2026-10-04T12:36:16.687783+00:00"
+    },
+    {
+      "ended_at": "2026-10-04T12:37:49.850194+00:00",
+      "input_count": 325623,
+      "issue_count": 0,
+      "output_count": 1325630,
+      "stage": "load_postgres",
+      "started_at": "2026-10-04T12:36:41.950930+00:00"
+    },
+    {
+      "ended_at": "2026-10-04T12:37:50.007205+00:00",
+      "input_count": 8,
+      "issue_count": 0,
+      "output_count": 8,
+      "stage": "measure_gold_storage",
+      "started_at": "2026-10-04T12:37:49.977526+00:00"
     }
   ],
-  "started_at": "2026-10-03T15:07:53.373887+00:00",
+  "started_at": "2026-10-04T12:36:02.665611+00:00",
   "status": "succeeded"
 }

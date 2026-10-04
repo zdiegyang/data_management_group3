@@ -1,0 +1,52 @@
+{
+  "tables": [
+    {
+      "schema": "gold",
+      "table": "circuit",
+      "bytes": 49152,
+      "megabytes": 0.05
+    },
+    {
+      "schema": "gold",
+      "table": "conditional_correction",
+      "bytes": 49152,
+      "megabytes": 0.05
+    },
+    {
+      "schema": "gold",
+      "table": "decoder_prediction",
+      "bytes": 302858240,
+      "megabytes": 288.83
+    },
+    {
+      "schema": "gold",
+      "table": "google_experiment",
+      "bytes": 49152,
+      "megabytes": 0.05
+    },
+    {
+      "schema": "gold",
+      "table": "google_shot",
+      "bytes": 124321792,
+      "megabytes": 118.56
+    },
+    {
+      "schema": "gold",
+      "table": "sim_experiment",
+      "bytes": 49152,
+      "megabytes": 0.05
+    },
+    {
+      "schema": "gold",
+      "table": "stabilizer_check",
+      "bytes": 65536,
+      "megabytes": 0.06
+    },
+    {
+      "schema": "gold",
+      "table": "syndrome_observation",
+      "bytes": 27869184,
+      "megabytes": 26.58
+    }
+  ]
+}

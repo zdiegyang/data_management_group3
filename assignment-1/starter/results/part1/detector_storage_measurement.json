@@ -1,30 +1,29 @@
 {
   "input": {
-    "silver_shot_path": "/workspace/silver/google_qec/shot.parquet",
-    "silver_shot_file_bytes": 16150379
+    "lake_object": "silver/google_qec/shot.parquet"
   },
   "source_statistics": {
     "shot_count": 250000,
     "total_detector_events": 10446925,
-    "average_detector_events_per_shot": 41,
+    "average_detector_events_per_shot": 41.7877,
     "max_detector_events_per_shot": 183,
     "shots_with_detector_events": 250000,
     "shots_without_detector_events": 0
   },
   "packed_representation": {
-    "description": "One row per shot with detector_bits stored as packed bytes.",
+    "description": "Detector-only: one row per shot with detector_bits stored as packed bytes.",
     "rows": 250000,
-    "detector_payload_bytes": 8750000,
-    "parquet_bytes": 16150379
+    "parquet_bytes": 5941517
   },
   "sparse_long_representation": {
-    "description": "One row per fired detector event.",
+    "description": "Detector-only: one row per fired detector event.",
     "rows": 10446925,
     "parquet_bytes": 12612830
   },
   "comparison": {
     "sparse_rows_per_packed_row": 41.7877,
     "row_count_ratio_sparse_to_packed": 41.7877,
-    "serialized_size_ratio_sparse_to_packed": 0.7809618585421432
+    "serialized_size_ratio_sparse_to_packed": 2.1228299102737567,
+    "packed_smaller": true
   }
 }

@@ -20,7 +20,7 @@ from rich.table import Table
 from .config import Settings
 from .connections import bronze_inventory, check_platform, minio_client
 from .models import StageResult
-from .stages import load_postgres, measure_detector, prepare_data, register_sources
+from .stages import load_postgres, measure_detector, prepare_data, register_sources, measure_gold_storage
 
 
 console = Console()
@@ -217,6 +217,21 @@ def _run_part1_stages(
         f"({res_prep.issue_count} issues) in {duration:.2f}s"
     )
 
+    # Stage 2.5: Measure detection-event storage on Silver tables
+    res_measure = measure_detector.run(run_id=run_id, settings=settings)
+    stage_results.append(res_measure)
+    duration = (
+        (res_measure.finished_at - res_measure.started_at).total_seconds()
+        if res_measure.finished_at
+        else 0.0
+    )
+    console.print(
+        f"[green]✓ Measuring detector-event storage:[/green] "
+        f"{res_measure.input_count:,} inputs -> {res_measure.output_count:,} outputs "
+        f"({res_measure.issue_count} issues) in {duration:.2f}s"
+    )
+    console.print("[bold green]✓ Part I Detection-event storage measured and saved as JSON![/bold green]")
+
     # Stage 3: Silver -> Gold (PostgreSQL)
     res_gold = load_postgres.run(run_id=run_id)
     stage_results.append(res_gold)
@@ -233,20 +248,22 @@ def _run_part1_stages(
 
     console.print("[bold green]✓ Part I Data Preparation completed successfully![/bold green]")
 
-    res_measure = measure_detector.run(run_id=run_id, settings=settings)
-    stage_results.append(res_measure)
+    # Stage 3.5: Measure Gold PostgreSQL table storage
+    gold_measure = measure_gold_storage.run(run_id=run_id, settings=settings)
+    stage_results.append(gold_measure)
     duration = (
-        (res_measure.finished_at - res_measure.started_at).total_seconds()
-        if res_measure.finished_at
+        (gold_measure.finished_at - gold_measure.started_at).total_seconds()
+        if gold_measure.finished_at
         else 0.0
     )
     console.print(
-        f"[green]✓ Measuring detector-event storage:[/green] "
-        f"{res_measure.input_count:,} inputs -> {res_measure.output_count:,} outputs "
-        f"({res_measure.issue_count} issues) in {duration:.2f}s"
+        f"[green]✓ Measuring PostgreSQL storage:[/green] "
+        f"{gold_measure.input_count:,} inputs -> {gold_measure.output_count:,} outputs "
+        f"({gold_measure.issue_count} issues) in {duration:.2f}s"
     )
-    console.print("[bold green]✓ Part I Detection-event storage measured and saved as JSON![/bold green]")
+    console.print("[bold green]✓ Part I PostgreSQL storage measured and saved as JSON![/bold green]")
 
+    
 
 def command_train(_: Settings) -> int:
     console.print(
