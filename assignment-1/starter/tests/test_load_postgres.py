@@ -1,4 +1,5 @@
 """Integration tests for Stage 3: Silver -> Gold PostgreSQL."""
+import json
 from pathlib import Path
 
 import psycopg
@@ -103,6 +104,14 @@ def test_gold_counts_match_silver():
     base_dir = Path(__file__).resolve().parents[1]
 
     load_postgres.run("gold-count-check")
+    row_counts_path = base_dir / "results" / "part1" / "row_counts.json"
+    row_counts = json.loads(row_counts_path.read_text())
+    gold_counts = row_counts["silver_to_gold"]
+
+    assert set(gold_counts) == set(GOLD_TABLE_KEYS)
+    for table, comparison in gold_counts.items():
+        assert comparison["loaded_count"] == _gold_row_count(settings, table)
+        assert comparison["matches"] is True
 
     expected_counts = {
         "syndrome_observation": (

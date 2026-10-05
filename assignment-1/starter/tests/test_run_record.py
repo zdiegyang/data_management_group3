@@ -33,6 +33,10 @@ def test_run_record_combines_all_stages(tmp_path):
             "loaded_count": 7,
             "matches": True,
         },
+        "syndrome_pattern": {"loaded_count": 11},
+        "decoder": {"loaded_count": 4},
+        "benchmark": {"loaded_count": 3},
+        "check_data_qubit": {"loaded_count": 24},
     }}))
     stages = [_bronze(), _silver(), _finished("load_postgres", output_count=7)]
 
@@ -44,7 +48,14 @@ def test_run_record_combines_all_stages(tmp_path):
     assert [stage["stage"] for stage in record["stages"]] == [
         "register_sources", "prepare_data", "load_postgres",
     ]
-    assert record["output_table_counts"] == {"silver/x/table.parquet": 7, "gold.google_shot": 7}
+    assert record["output_table_counts"] == {
+        "silver/x/table.parquet": 7,
+        "gold.google_shot": 7,
+        "gold.syndrome_pattern": 11,
+        "gold.decoder": 4,
+        "gold.benchmark": 3,
+        "gold.check_data_qubit": 24,
+    }
     assert record["issue_count"] == 2
     assert record["checks"] == [{"rule_id": "RULE_X", "outcome": "passed"}]
     assert len(record["code_sha256"]) == 64

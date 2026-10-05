@@ -253,22 +253,30 @@ def run(run_id: str) -> StageResult:
     existing = json.loads(row_counts_path.read_text()) if row_counts_path.exists() else {}
     expected_counts = {
         "sim_experiment": len(experiments),
+        "syndrome_pattern": len(patterns),
         "syndrome_observation": len(syn_rows),
         "google_experiment": len(exp_rows),
         "google_shot": len(shot_rows),
+        "decoder": len(DECODER_NAMES),
         "decoder_prediction": len(shot_rows) * len(DECODER_NAMES),
+        "benchmark": len(benchmarks),
         "circuit": len(circuit_rows),
         "stabilizer_check": len(sc_rows),
+        "check_data_qubit": len(check_data_qubit_rows),
         "conditional_correction": len(cc_rows),
     }
     formulas = {
         "sim_experiment": "distinct experiment_id values in syndrome_observation Silver",
+        "syndrome_pattern": "distinct syndrome_bits values in syndrome_observation Silver",
         "syndrome_observation": "syndrome_observation Silver rows",
         "google_experiment": "experiment Silver rows",
         "google_shot": "shot Silver rows",
+        "decoder": "supplied decoder lookup rows",
         "decoder_prediction": f"{len(DECODER_NAMES)} decoder rows per shot Silver row",
+        "benchmark": "distinct benchmark_name values in circuit Silver",
         "circuit": "circuit Silver rows",
         "stabilizer_check": "stabilizer_check Silver rows",
+        "check_data_qubit": "data_qubits values across stabilizer_check Silver rows",
         "conditional_correction": "conditional_correction Silver rows",
     }
     existing["silver_to_gold"] = _silver_to_gold_comparisons(
@@ -277,6 +285,12 @@ def run(run_id: str) -> StageResult:
         formulas,
     )
     row_counts_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+    if settings.lake_backend == "minio":
+        minio_client(settings).fput_object(
+            settings.s3_bucket,
+            "results/part1/row_counts.json",
+            str(row_counts_path),
+        )
 
     result.input_count = len(syn_rows) + len(exp_rows) + len(shot_rows) + len(circuit_rows) \
                          + len(sc_rows) + len(cc_rows)
@@ -284,4 +298,3 @@ def run(run_id: str) -> StageResult:
     result.issue_count = 0
     result.finish()
     return result
-
