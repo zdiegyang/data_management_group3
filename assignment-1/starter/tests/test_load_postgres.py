@@ -3,10 +3,12 @@ from pathlib import Path
 
 import psycopg
 import pyarrow.parquet as pq
+import io
 
 from quantum_lake_student.config import Settings
 from quantum_lake_student.connections import postgres_connection
 from quantum_lake_student.stages import load_postgres
+from quantum_lake_student.connections import minio_client
 
 GOLD_TABLE_KEYS = {
     "sim_experiment": ("experiment_id",),
@@ -69,8 +71,22 @@ def test_load_postgres_is_repeatable():
     assert first == second
 
 
-def _silver_row_count(base_dir: Path, relative_path: str) -> int:
+def _silver_row_count(settings, base_dir: Path, relative_path: str) -> int:
     path = base_dir / "silver" / relative_path
+
+    if settings.lake_backend == "minio":
+        client = minio_client(settings)
+        response = client.get_object(
+            settings.s3_bucket,
+            f"silver/{relative_path}",
+        )
+        try:
+            data = response.read()
+            return pq.read_table(io.BytesIO(data)).num_rows
+        finally:
+            response.close()
+            response.release_conn()
+    
     assert path.exists(), f"Silver table missing: {path}"
     return pq.read_table(path).num_rows
 
@@ -110,7 +126,7 @@ def test_gold_counts_match_silver():
     }
 
     for gold_table, silver_path in expected_counts.items():
-        silver_count = _silver_row_count(base_dir, silver_path)
+        silver_count = _silver_row_count(settings, base_dir, silver_path)
         gold_count = _gold_row_count(settings, gold_table)
 
         assert silver_count == gold_count, (
