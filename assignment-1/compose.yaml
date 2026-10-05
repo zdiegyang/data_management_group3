@@ -71,6 +71,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantum-course-only}
       JUPYTER_TOKEN: ${JUPYTER_TOKEN:-quantum-course}
       PYTHONPATH: /workspace/src
+      # The image has no git; run.json reads the commit from this mount.
+      QUANTUM_GIT_DIR: /repo-git
     command:
       - sh
       - -c
@@ -83,6 +85,7 @@ services:
     volumes:
       - ./starter:/workspace
       - ./datasets/student-bundle/core:/course-data:ro
+      - ../.git:/repo-git:ro
     depends_on:
       postgres:
         condition: service_healthy

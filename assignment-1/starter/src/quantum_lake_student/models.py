@@ -47,6 +47,8 @@ class StageResult:
     issue_count: int = 0
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
+    # Facts the run record needs from a stage, e.g. input hashes or output counts.
+    details: dict[str, Any] = field(default_factory=dict)
 
     def finish(self) -> None:
         self.finished_at = datetime.now(UTC)

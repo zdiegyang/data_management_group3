@@ -89,6 +89,7 @@ def run(run_id: str) -> StageResult:
 
     result.input_count = len(manifest)
     matched_keys: set[str] = set()
+    verified_hashes: dict[str, str] = {}
 
     for entry in manifest:
         suffix = _source_suffix(entry["path"])
@@ -116,6 +117,7 @@ def run(run_id: str) -> StageResult:
                 f"Checksum mismatch for {key}: expected {entry['sha256']}, "
                 f"got {actual_sha256}"
             )
+        verified_hashes[key] = actual_sha256
 
         if key.endswith(".zip"):
             unsafe = _unsafe_zip_members(data)
@@ -130,6 +132,7 @@ def run(run_id: str) -> StageResult:
 
     result.output_count = len(matched_keys)
     result.issue_count = len(unexpected)
+    result.details["input_hashes"] = verified_hashes
     result.finish()
     return result
 

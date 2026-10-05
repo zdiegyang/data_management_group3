@@ -69,46 +69,20 @@ def save_source_traces(
     trace_file_path: Path,
     settings: Settings | None = None,
 ) -> int:
-    """Save or update source trace records idempotently.
-
-    Appends new records and deduplicates by (source_record_id, archive_member, record_locator),
-    preserving traces across all tables and sources while ensuring zero duplicate rows upon re-runs.
-    """
+    """Overwrite the trace file with the supplied source trace records."""
     trace_file_path = Path(trace_file_path)
     trace_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     table_new = normalize_trace_table(new_records)
-
-    if trace_file_path.exists():
-        table_existing = pq.read_table(trace_file_path)
-        if "valid" not in table_existing.column_names:
-            valids = pa.array(["yes"] * table_existing.num_rows, type=pa.string())
-            table_existing = table_existing.append_column("valid", valids)
-            table_existing = table_existing.cast(SOURCE_TRACE_SCHEMA)
-
-        df_existing = table_existing.to_pandas()
-        df_new = table_new.to_pandas()
-        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-        # Deduplicate across the full composite primary key of the trace table
-        df_combined = df_combined.drop_duplicates(
-            subset=["source_record_id", "archive_member", "record_locator"],
-            keep="last",
-        )
-        table_final = pa.Table.from_pandas(
-            df_combined,
-            schema=SOURCE_TRACE_SCHEMA,
-            preserve_index=False,
-        )
-    else:
-        df_new = table_new.to_pandas().drop_duplicates(
-            subset=["source_record_id", "archive_member", "record_locator"],
-            keep="last",
-        )
-        table_final = pa.Table.from_pandas(
-            df_new,
-            schema=SOURCE_TRACE_SCHEMA,
-            preserve_index=False,
-        )
+    df_new = table_new.to_pandas().drop_duplicates(
+        subset=["source_record_id", "archive_member", "record_locator"],
+        keep="last",
+    )
+    table_final = pa.Table.from_pandas(
+        df_new,
+        schema=SOURCE_TRACE_SCHEMA,
+        preserve_index=False,
+    )
 
     pq.write_table(table_final, trace_file_path, compression="zstd")
 

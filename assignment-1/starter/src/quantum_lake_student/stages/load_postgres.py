@@ -107,6 +107,22 @@ def _distance_from_experiment_id(experiment_id: str) -> int:
     return int(first.split("-")[1])
 
 
+def _silver_to_gold_comparisons(
+    expected_counts: dict[str, int],
+    loaded_counts: dict[str, int],
+    formulas: dict[str, str],
+) -> dict[str, dict[str, int | bool | str]]:
+    return {
+        table: {
+            "expected_silver_count": expected,
+            "loaded_count": loaded_counts[table],
+            "matches": expected == loaded_counts[table],
+            "expected_from": formulas[table],
+        }
+        for table, expected in expected_counts.items()
+    }
+
+
 def run(run_id: str) -> StageResult:
     settings = Settings.from_environment()
 
@@ -235,7 +251,31 @@ def run(run_id: str) -> StageResult:
     RESULTS.mkdir(parents=True, exist_ok=True)
     row_counts_path = RESULTS / "row_counts.json"
     existing = json.loads(row_counts_path.read_text()) if row_counts_path.exists() else {}
-    existing["silver_to_gold"] = counts
+    expected_counts = {
+        "sim_experiment": len(experiments),
+        "syndrome_observation": len(syn_rows),
+        "google_experiment": len(exp_rows),
+        "google_shot": len(shot_rows),
+        "decoder_prediction": len(shot_rows) * len(DECODER_NAMES),
+        "circuit": len(circuit_rows),
+        "stabilizer_check": len(sc_rows),
+        "conditional_correction": len(cc_rows),
+    }
+    formulas = {
+        "sim_experiment": "distinct experiment_id values in syndrome_observation Silver",
+        "syndrome_observation": "syndrome_observation Silver rows",
+        "google_experiment": "experiment Silver rows",
+        "google_shot": "shot Silver rows",
+        "decoder_prediction": f"{len(DECODER_NAMES)} decoder rows per shot Silver row",
+        "circuit": "circuit Silver rows",
+        "stabilizer_check": "stabilizer_check Silver rows",
+        "conditional_correction": "conditional_correction Silver rows",
+    }
+    existing["silver_to_gold"] = _silver_to_gold_comparisons(
+        expected_counts,
+        counts,
+        formulas,
+    )
     row_counts_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
     result.input_count = len(syn_rows) + len(exp_rows) + len(shot_rows) + len(circuit_rows) \
