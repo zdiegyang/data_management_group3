@@ -9,6 +9,9 @@ starter/.coverage
 .idea
 .venv
 
+# Raw course data archives
+datasets/student-bundle/core/raw/
+
 # Generated Silver Parquet files
 starter/silver/**/*.parquet
 
