@@ -9,11 +9,15 @@ starter/.coverage
 .idea
 .venv
 
-starter/results/part1/data_issues.parquet
-starter/results/part1/source_trace.parquet
-starter/silver/google_qec/experiment.parquet
-starter/silver/google_qec/shot.parquet
-starter/silver/qasmbench/circuit.parquet
-starter/silver/qasmbench/conditional_correction.parquet
-starter/silver/qasmbench/stabilizer_check.parquet
-starter/silver/qec_syndromes/syndrome_observation.parquet
+# Raw course data archives
+datasets/student-bundle/core/raw/
+
+# Generated Silver Parquet files
+starter/silver/**/*.parquet
+
+# Generated Part 1 results (ignore outputs, keep README)
+starter/results/part1/*
+!starter/results/part1/README.md
+
+# Jupyter notebook checkpoints
+**/.ipynb_checkpoints/

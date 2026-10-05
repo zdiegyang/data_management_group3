@@ -1,6 +1,9 @@
 .Trash-0/
 **/.ipynb_checkpoints/
-assignment-1/starter/silver
-assignment-1/starter/results/**/*.parquet
+assignment-1/datasets/student-bundle/core/raw/
+assignment-1/starter/silver/**/*.parquet
+assignment-1/starter/results/part1/*
+!assignment-1/starter/results/part1/README.md
 .idea
 .venv
+.DS_Store

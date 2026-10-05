@@ -31,7 +31,7 @@ def _silver_snapshot(base_dir: Path):
     return snapshot
 
 def test_prepare_data_is_repeatable():
-    base_dir = Path(__file__).resolve.parents[1]
+    base_dir = Path(__file__).resolve().parents[1]
 
     prepare_data.run("repeatability-run-1")
     first = _silver_snapshot(base_dir)

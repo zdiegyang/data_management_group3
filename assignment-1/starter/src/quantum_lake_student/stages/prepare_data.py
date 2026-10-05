@@ -152,12 +152,14 @@ def _record_check(
     rule_id: str,
     checked: int = 1,
     observation: str | None = None,
+    failed: int = 0,
 ) -> None:
     """Count how many records a rule evaluated, plus any expected observation."""
     if checks is None:
         return
-    entry = checks.setdefault(rule_id, {"checked": 0, "observations": []})
+    entry = checks.setdefault(rule_id, {"checked": 0, "observations": [], "failed": 0})
     entry["checked"] += checked
+    entry["failed"] += failed
     if observation and observation not in entry["observations"]:
         entry["observations"].append(observation)
 
@@ -627,6 +629,7 @@ def prepare_syndrome_observations(
                             raise ValueError("Syndrome bits must all be 0 or 1")
                         syndrome_bytes = bytes(flat_bits)
                     except Exception as e:
+                        _record_check(checks, "RULE_SYN_SHAPE_DOMAIN", checked=0, failed=1)
                         issues.append({
                             "issue_id": _stable_issue_id(
                                 source_record_id, "RULE_SYN_SHAPE_DOMAIN", row[1]
@@ -655,6 +658,7 @@ def prepare_syndrome_observations(
                         if quantity <= 0:
                             raise ValueError("Quantity must be greater than zero")
                     except Exception as e:
+                        _record_check(checks, "RULE_SYN_QUANTITY_POSITIVE", checked=0, failed=1)
                         issues.append({
                             "issue_id": _stable_issue_id(
                                 source_record_id, "RULE_SYN_QUANTITY_POSITIVE", row[2]

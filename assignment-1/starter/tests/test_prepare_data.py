@@ -45,7 +45,8 @@ def _syndrome_archive(rows):
     writer = csv.writer(csv_buffer)
     writer.writerow(["labels", "syndromes", "quantity"])
     for label, syndrome, quantity in rows:
-        writer.writerow([label, repr(syndrome), quantity])
+        syndrome_text = syndrome if isinstance(syndrome, str) else repr(syndrome)
+        writer.writerow([label, syndrome_text, quantity])
 
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, "w") as archive:
@@ -432,6 +433,9 @@ def test_prepare_data_stage_execution():
             "variant",
             "register_declarations",
             "qubit_count",
+            # Extra Silver field (allowed by silver-tables.md): data-sources.md
+            # lists the operation count under "At minimum, extract".
+            "operation_count",
             "measurement_count",
             "two_qubit_gate_count",
         ],
