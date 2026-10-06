@@ -20,7 +20,14 @@ from rich.table import Table
 from .config import Settings
 from .connections import bronze_inventory, check_platform, minio_client
 from .models import StageResult
-from .stages import load_postgres, measure_detector, prepare_data, register_sources, measure_gold_storage
+from .stages import (
+    build_ml_tables,
+    load_postgres,
+    measure_detector,
+    measure_gold_storage,
+    prepare_data,
+    register_sources,
+)
 
 
 console = Console()
@@ -114,7 +121,9 @@ def write_run_record(
     """Write run.json for the whole Part I run from the stages' results."""
     details = {result.stage: result.details for result in stage_results}
 
-    output_table_counts = dict(details.get("prepare_data", {}).get("output_table_counts", {}))
+    output_table_counts: dict[str, Any] = {}
+    for stage_details in details.values():
+        output_table_counts.update(stage_details.get("output_table_counts", {}))
     if "load_postgres" in details:
         gold_counts = _read_json(results_dir / "row_counts.json").get("silver_to_gold", {})
         for table, comparison in gold_counts.items():
@@ -147,6 +156,8 @@ def write_run_record(
         "output_table_counts": output_table_counts,
         "issue_count": sum(result.issue_count for result in stage_results),
         "checks": details.get("prepare_data", {}).get("checks", []),
+        # Part II records "the hashes of both input tables"; Part I records them too.
+        "ml_tables": details.get("build_ml_tables", {}).get("ml_tables", {}),
     }
     if error is not None:
         record["error"] = {
@@ -263,7 +274,21 @@ def _run_part1_stages(
     )
     console.print("[bold green]✓ Part I PostgreSQL storage measured and saved as JSON![/bold green]")
 
-    
+    # Stage 4: Gold -> ML. Reads only Gold views; writes both ML tables to the lake.
+    res_ml = build_ml_tables.run(run_id=run_id, settings=settings)
+    stage_results.append(res_ml)
+    duration = (
+        (res_ml.finished_at - res_ml.started_at).total_seconds()
+        if res_ml.finished_at
+        else 0.0
+    )
+    console.print(
+        f"[green]✓ Stage 4 (build_ml_tables):[/green] "
+        f"{res_ml.output_count:,} ML examples written "
+        + ", ".join(f"{key} ({out['rows']:,})" for key, out in res_ml.details["ml_tables"].items())
+        + f" in {duration:.2f}s"
+    )
+
 
 def command_train(_: Settings) -> int:
     console.print(

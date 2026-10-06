@@ -8,10 +8,11 @@ SELECT
     o.experiment_id,
     e.physical_fault_rate,
     o.syndrome_bits,
-    4::int                                    AS round_count,
-    4::int                                    AS check_count,
+    p.round_count,
+    p.check_count,
     o.logical_error_label,
     o.quantity                                AS sample_weight,
     o.source_record_id                        -- lineage only; NOT exported
 FROM gold.syndrome_observation o
-JOIN gold.sim_experiment e USING (experiment_id);
+JOIN gold.sim_experiment e USING (experiment_id)
+JOIN gold.syndrome_pattern p USING (syndrome_bits);
