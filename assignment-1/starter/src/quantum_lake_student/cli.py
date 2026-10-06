@@ -291,12 +291,19 @@ def _run_part1_stages(
 
 
 def command_train(_: Settings) -> int:
-    console.print(
-        "[yellow]The AI/ML stage is intentionally unimplemented.[/yellow]\n"
-        "Consume the required ML input tables through the supplied helpers and "
-        "write model files and the required results/part2 files."
+    started_at = datetime.now(UTC)
+    run_id = f"model_{started_at.strftime('%Y%m%d_%H%M%S')}"
+
+    result = train.run(
+        model_run_id=run_id,
+        settings=settings,
     )
-    return 2
+
+    console.print(
+        f"[green]✓ Part II completed:[/green] "
+        f"{result.output_count} outputs"
+    )
+    return 0
 
 
 def parser() -> argparse.ArgumentParser:
