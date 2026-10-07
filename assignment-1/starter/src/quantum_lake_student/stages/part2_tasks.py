@@ -226,6 +226,22 @@ def _run_task_b_distance(
     return predictions, metrics, {combined_id: artifact}, diagnostics
 
 
+def _detector_features(row: dict[str, Any]) -> np.ndarray:
+    """The 200 unpacked detector bits of one distance-3 shot, in detector order.
+
+    Uses the supplied little-endian helper, which also drops byte padding.
+    """
+    values = np.asarray(
+        unpack_little_endian_bits(row["detector_bits"], int(row["detector_count"])),
+        dtype=float,
+    )
+    if values.shape != (200,):
+        raise MlContractError(
+            f"Task C: expected 200 detector bits, got {values.shape} for {row['example_id']}"
+        )
+    return values
+
+
 def _run_task_c(
     rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -243,16 +259,7 @@ def _run_task_c(
     if any(not by_split[split] for split in REQUIRED_SPLITS):
         raise MlContractError("Task C fixed subset does not contain all supplied splits")
 
-    def bits(row: dict[str, Any]) -> np.ndarray:
-        values = np.asarray(
-            unpack_little_endian_bits(row["detector_bits"], int(row["detector_count"])),
-            dtype=float,
-        )
-        if values.shape != (200,):
-            raise MlContractError(
-                f"Task C: expected 200 detector bits, got {values.shape} for {row['example_id']}"
-            )
-        return values
+    bits = _detector_features
 
     x_train = np.asarray([bits(row) for row in by_split[TRAIN_SPLIT]], dtype=float)
     y_train = np.asarray([bool(row["actual_observable_flip"]) for row in by_split[TRAIN_SPLIT]])
