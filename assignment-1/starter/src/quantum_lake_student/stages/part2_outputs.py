@@ -1,12 +1,9 @@
 """Persistence, provenance, and report generation for Part II."""
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import json
-import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,10 +12,8 @@ import joblib
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quantum_lake_student.config import Settings
 from quantum_lake_student.ml import GOOGLE_META_PREDICTION_COLUMNS
 
-from .part2_contracts import _object_bytes
 
 PROJECT = Path(__file__).resolve().parents[3]
 RESULTS_DIR = PROJECT / "results" / "part2"
@@ -59,54 +54,6 @@ def _save_models(artifacts: dict[str, dict[str, Any]]) -> dict[str, str]:
     return locations
 
 
-def _git_revision() -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=PROJECT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        revision = result.stdout.strip()
-        if revision:
-            return revision
-    except (OSError, subprocess.CalledProcessError):
-        pass
-
-    git_dir = os.environ.get("QUANTUM_GIT_DIR")
-    candidates = [Path(git_dir)] if git_dir else []
-    candidates.extend(path / ".git" for path in (PROJECT, *PROJECT.parents))
-    for directory in candidates:
-        head = directory / "HEAD"
-        if not head.is_file():
-            continue
-        value = head.read_text(encoding="utf-8").strip()
-        if value.startswith("ref: "):
-            ref = directory / value[6:]
-            if ref.is_file():
-                return ref.read_text(encoding="utf-8").strip() or None
-            packed = directory / "packed-refs"
-            if packed.is_file():
-                for line in packed.read_text(encoding="utf-8").splitlines():
-                    if line and not line.startswith("#") and line.endswith(f" {value[6:]}"):
-                        return line.split()[0]
-        elif value:
-            return value
-    return None
-
-
-def _code_sha256() -> str:
-    digest = hashlib.sha256()
-    for path in sorted(
-        [*PROJECT.glob("src/**/*.py"), *PROJECT.glob("sql/**/*.sql")]
-    ):
-        digest.update(path.relative_to(PROJECT).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def _package_versions() -> dict[str, str | None]:
     names = ["numpy", "pyarrow", "scikit-learn", "joblib"]
     versions: dict[str, str | None] = {"python": sys.version.split()[0]}
@@ -116,28 +63,6 @@ def _package_versions() -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
-
-
-def _data_release_version(settings: Settings) -> str | None:
-    """Read the release identifier from the course manifest when available."""
-    manifest_key = "metadata/course-release/bundle-manifest.json"
-    try:
-        raw = _object_bytes(settings, manifest_key)
-        payload = json.loads(raw)
-    except (FileNotFoundError, OSError, ValueError, KeyError):
-        return None
-
-    for key in (
-        "data_release_version",
-        "release_version",
-        "version",
-        "release",
-        "data_release",
-    ):
-        value = payload.get(key)
-        if isinstance(value, (str, int, float)):
-            return str(value)
-    return None
 
 
 def _report_markdown(

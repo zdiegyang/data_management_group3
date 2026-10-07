@@ -13,21 +13,20 @@ from time import perf_counter
 
 from quantum_lake_student.config import Settings
 from quantum_lake_student.models import StageResult
+from quantum_lake_student.provenance import code_sha256, git_revision
 
 from .part2_contracts import (
     GOOGLE_KEY,
     GOOGLE_SCHEMA,
     SYNDROME_KEY,
     SYNDROME_SCHEMA,
+    _data_release,
     _read_ml_table,
     _validate_google,
     _validate_syndrome,
 )
 from .part2_outputs import (
     RESULTS_DIR,
-    _data_release_version,
-    _git_revision,
-    _code_sha256,
     _package_versions,
     _report_markdown,
     _save_models,
@@ -101,13 +100,13 @@ def run(model_run_id: str, settings: Settings | None = None) -> StageResult:
         "started_at": started_at.isoformat(),
         "ended_at": datetime.now(UTC).isoformat(),
         "elapsed_wall_time_seconds": perf_counter() - wall_start,
-        "data_release_version": _data_release_version(settings),
+        "data_release_version": _data_release(syndrome_table, google_table),
         "input_tables": {
             SYNDROME_KEY: {"rows": len(syndrome_rows), "sha256": syndrome_hash, "bytes": len(syndrome_raw)},
             GOOGLE_KEY: {"rows": len(google_rows), "sha256": google_hash, "bytes": len(google_raw)},
         },
-        "code_revision": _git_revision(),
-        "code_sha256": _code_sha256(),
+        "code_revision": git_revision(),
+        "code_sha256": code_sha256(),
         "dependencies": _package_versions(),
         "random_seed": 20261006,
         "splits": {

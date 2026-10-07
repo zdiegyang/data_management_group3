@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from math import ceil
 from pathlib import Path
 from typing import Any, Sequence
@@ -101,6 +102,28 @@ def _read_ml_table(
         )
 
     return table, raw, hashlib.sha256(raw).hexdigest()
+
+
+# Written by Part I's build_ml_tables into both ML tables' Parquet metadata.
+RELEASE_METADATA_KEY = b"quantum_lake.data_release"
+
+
+def _data_release(*tables: pa.Table) -> dict[str, Any]:
+    """The course data release recorded inside the ML tables.
+
+    Spec: training records "the course data-release identifier" while reading
+    the two ML tables "and nothing else", so it comes from the tables
+    themselves. Both tables must name the same release.
+    """
+    releases = []
+    for table in tables:
+        raw = (table.schema.metadata or {}).get(RELEASE_METADATA_KEY)
+        if raw is None:
+            raise MlContractError("ML table carries no data-release metadata; rerun `make run`")
+        releases.append(json.loads(raw))
+    if any(release != releases[0] for release in releases):
+        raise MlContractError(f"ML tables come from different data releases: {releases}")
+    return releases[0]
 
 
 def _validate_ids_and_splits(rows: Sequence[dict[str, Any]], table_name: str) -> None:

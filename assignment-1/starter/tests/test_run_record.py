@@ -3,7 +3,7 @@
 import json
 from datetime import UTC, datetime
 
-from quantum_lake_student import cli
+from quantum_lake_student import cli, provenance
 from quantum_lake_student.models import StageResult
 
 
@@ -89,9 +89,9 @@ def test_git_revision_is_read_from_git_files_without_git(tmp_path, monkeypatch):
     (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
     (git_dir / "refs/heads/main").write_text("abc123\n")
     monkeypatch.setenv("QUANTUM_GIT_DIR", str(git_dir))
-    monkeypatch.setattr(cli.subprocess, "run", _no_git)
+    monkeypatch.setattr(provenance.subprocess, "run", _no_git)
 
-    assert cli.git_revision(start=tmp_path / "elsewhere") == "abc123"
+    assert provenance.git_revision(start=tmp_path / "elsewhere") == "abc123"
 
 
 def test_git_revision_falls_back_to_packed_refs(tmp_path, monkeypatch):
@@ -100,19 +100,19 @@ def test_git_revision_falls_back_to_packed_refs(tmp_path, monkeypatch):
     (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
     (git_dir / "packed-refs").write_text("# pack-refs\ndef456 refs/heads/main\n")
     monkeypatch.setenv("QUANTUM_GIT_DIR", str(git_dir))
-    monkeypatch.setattr(cli.subprocess, "run", _no_git)
+    monkeypatch.setattr(provenance.subprocess, "run", _no_git)
 
-    assert cli.git_revision(start=tmp_path / "elsewhere") == "def456"
+    assert provenance.git_revision(start=tmp_path / "elsewhere") == "def456"
 
 
 def test_code_sha256_changes_when_code_changes(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src/a.py").write_text("x = 1\n")
-    first = cli.code_sha256(tmp_path)
+    first = provenance.code_sha256(tmp_path)
 
-    assert cli.code_sha256(tmp_path) == first
+    assert provenance.code_sha256(tmp_path) == first
     (tmp_path / "src/a.py").write_text("x = 2\n")
-    assert cli.code_sha256(tmp_path) != first
+    assert provenance.code_sha256(tmp_path) != first
 
 
 def _no_git(*args, **kwargs):
