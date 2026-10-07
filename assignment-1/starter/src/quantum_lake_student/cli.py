@@ -27,6 +27,7 @@ from .stages import (
     measure_gold_storage,
     prepare_data,
     register_sources,
+    train
 )
 
 
@@ -290,19 +291,24 @@ def _run_part1_stages(
     )
 
 
-def command_train(_: Settings) -> int:
+def command_train(settings: Settings) -> int:
+    """Run Part II from the two materialized ML Parquet tables only."""
     started_at = datetime.now(UTC)
     run_id = f"model_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    console.print(f"[bold blue]Starting Part II ML stage (Run ID: {run_id})...[/bold blue]")
 
-    result = train.run(
-        model_run_id=run_id,
-        settings=settings,
+    result = train.run(model_run_id=run_id, settings=settings)
+    duration = (
+        (result.finished_at - result.started_at).total_seconds()
+        if result.finished_at
+        else 0.0
     )
-
     console.print(
-        f"[green]✓ Part II completed:[/green] "
-        f"{result.output_count} outputs"
+        f"[green]✓ Part II:[/green] {result.input_count:,} inputs -> "
+        f"{result.output_count:,} prediction rows ({result.issue_count} issues) "
+        f"in {duration:.2f}s"
     )
+    console.print("[bold green]✓ results/part2 regenerated successfully![/bold green]")
     return 0
 
 
