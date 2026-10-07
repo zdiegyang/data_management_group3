@@ -46,38 +46,6 @@ def _rows(path: Path, silver_key:str) -> list[dict[str, Any]]:
     return pq.read_table(path).to_pylist()
 
 
-def _copy_upsert(
-    conn: psycopg.Connection,
-    table: str,
-    columns: Sequence[str],
-    conflict_cols: Sequence[str],
-    rows: Iterable[dict[str, Any]],
-) -> int:
-    """Load `rows` into `table` via COPY -> temp table -> INSERT ... ON CONFLICT DO UPDATE.
-
-    Returns the number of rows sent. Update-on-conflict (not DO NOTHING) so a
-    rerun after a parser fix corrects existing Gold rows instead of leaving
-    them stale, while never creating a duplicate business record.
-    """
-    rows = list(rows)
-    if not rows:
-        return 0
-    tmp = f"tmp_{table.replace('.', '_')}"
-    col_list = ", ".join(columns)
-    conn.execute(f"CREATE TEMP TABLE {tmp} (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP")
-    with conn.cursor().copy(f"COPY {tmp} ({col_list}) FROM STDIN") as copy:
-        for row in rows:
-            copy.write_row(tuple(row[c] for c in columns))
-    update_cols = [c for c in columns if c not in conflict_cols]
-    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-    conn.execute(f"""
-        INSERT INTO {table} ({col_list})
-        SELECT {col_list} FROM {tmp}
-        ON CONFLICT ({", ".join(conflict_cols)}) DO UPDATE SET {set_clause}
-    """)
-    return len(rows)
-
-
 def _copy_load(
         conn: psycopg.Connection,
         table: str,

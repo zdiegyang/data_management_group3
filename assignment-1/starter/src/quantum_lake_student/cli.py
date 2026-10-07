@@ -21,6 +21,7 @@ from .config import Settings
 from .connections import bronze_inventory, check_platform, minio_client
 from .models import StageResult
 from .stages import load_postgres, measure_detector, prepare_data, register_sources, measure_gold_storage
+from quantum_lake_student import build_trace
 
 
 console = Console()
@@ -261,6 +262,11 @@ def _run_part1_stages(
         f"{gold_measure.input_count:,} inputs -> {gold_measure.output_count:,} outputs "
         f"({gold_measure.issue_count} issues) in {duration:.2f}s"
     )
+    # # build trace
+    # trace = build_trace.run(run_id=run_id)
+    # stage_results.append(trace)
+    # console.print("[bold green]✓ build_trace.json examples")
+
     console.print("[bold green]✓ Part I PostgreSQL storage measured and saved as JSON![/bold green]")
 
     

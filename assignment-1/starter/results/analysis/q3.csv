@@ -1,0 +1,13 @@
+﻿benchmark_name,variant,check_id,data_qubits,ancilla_qubit,syndrome_bit,condition_register,condition_value,gate,target_qubit
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:0,"q[0], q[1]",a[0],syn[0],syn,1,x,q[0]
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:0,"q[0], q[1]",a[0],syn[0],syn,2,x,q[2]
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:0,"q[0], q[1]",a[0],syn[0],syn,3,x,q[1]
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:1,"q[1], q[2]",a[1],syn[1],syn,1,x,q[0]
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:1,"q[1], q[2]",a[1],syn[1],syn,2,x,q[2]
+qec_sm_n5,source,qasmbench:small/qec_sm_n5/qec_sm_n5:check:1,"q[1], q[2]",a[1],syn[1],syn,3,x,q[1]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:0,"q[0], q[1]",a[0],syn[0],syn,1,x,q[0]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:0,"q[0], q[1]",a[0],syn[0],syn,2,x,q[2]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:0,"q[0], q[1]",a[0],syn[0],syn,3,x,q[1]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:1,"q[1], q[2]",a[1],syn[1],syn,1,x,q[0]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:1,"q[1], q[2]",a[1],syn[1],syn,2,x,q[2]
+qec_sm_n5,transpiled,qasmbench:small/qec_sm_n5/qec_sm_n5_transpiled:check:1,"q[1], q[2]",a[1],syn[1],syn,3,x,q[1]
