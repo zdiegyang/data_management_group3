@@ -26,6 +26,7 @@ from .stages import (
     measure_gold_storage,
     prepare_data,
     register_sources,
+    run_analyses,
     train
 )
 
@@ -239,6 +240,14 @@ def _run_part1_stages(
         f"{res_ml.output_count:,} ML examples written "
         + ", ".join(f"{key} ({out['rows']:,})" for key, out in res_ml.details["ml_tables"].items())
         + f" in {duration:.2f}s"
+    )
+
+    # Stage 5: the analysis questions, as committed SQL against Gold.
+    res_analyses = run_analyses.run(run_id=run_id, settings=settings)
+    stage_results.append(res_analyses)
+    console.print(
+        f"[green]✓ Stage 5 (run_analyses):[/green] {res_analyses.input_count} queries -> "
+        "results/part1/analysis/"
     )
 
 

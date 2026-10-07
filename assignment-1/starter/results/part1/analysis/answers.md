@@ -1,149 +1,28 @@
-# Analysis #
-The query for each of the question is attached and the result of the query was downloaded as a .csv file in this folder.
-The .csv files were obtained by running the queries below in the Adminer SQL command section on `localhost:8080`
+# Part I analyses
 
-## Q1 : How do weighted syndrome frequency and logical-error labels change with physical fault rate? ##
-```sql
-WITH weighted AS (
-    SELECT
-        e.experiment_id,
-        e.physical_fault_rate,
-        p.hamming_weight,
-        o.logical_error_label,
-        SUM(o.quantity) AS weighted_shots
-    FROM gold.syndrome_observation AS o
-    JOIN gold.sim_experiment AS e
-        ON e.experiment_id = o.experiment_id
-    JOIN gold.syndrome_pattern AS p
-        ON p.syndrome_bits = o.syndrome_bits
-    GROUP BY
-        e.experiment_id,
-        e.physical_fault_rate,
-        p.hamming_weight,
-        o.logical_error_label
-),
-totals AS (
-    SELECT
-        experiment_id,
-        SUM(weighted_shots) AS total_shots
-    FROM weighted
-    GROUP BY experiment_id
-)
-SELECT
-    w.physical_fault_rate,
-    w.hamming_weight,
-    SUM(w.weighted_shots) AS weighted_shots,
-    ROUND(
-        SUM(w.weighted_shots)::numeric / t.total_shots,
-        6
-    ) AS weighted_frequency,
-    ROUND(
-        SUM(w.weighted_shots)
-            FILTER (WHERE w.logical_error_label)
-        ::numeric / SUM(w.weighted_shots),
-        6
-    ) AS weighted_logical_error_rate
-FROM weighted AS w
-JOIN totals AS t
-    ON t.experiment_id = w.experiment_id
-GROUP BY
-    w.experiment_id,
-    w.physical_fault_rate,
-    w.hamming_weight,
-    t.total_shots
-ORDER BY
-    w.physical_fault_rate,
-    w.hamming_weight;
-```
-We grouped the syndrome observations by physical fault rate and Hamming weight in order to show that higher weight syndromes
-become more common as the simulated fault rate changes. The tables we joined are the `syndrome_observation`, `syndrome_experiment` and `syndrome_pattern`. 
-The data shows an association between physical fault rate, syndrome-pattern frequency and logical-error frequency. The same syndrome 
-pattern can also occur with different logical-error labels.
-## Q2 : How do the supplied decoder logical-error rates compare by code distance and distance-three processor location? ##
-```sql
-SELECT
-    e.distance,
-    e.center_row,
-    e.center_col,
-    d.decoder_name,
-    COUNT(*) AS shots,
-    COUNT(*) FILTER (
-        WHERE p.predicted_flip <> s.actual_observable_flip
-    ) AS decoder_errors,
-    ROUND(
-        COUNT(*) FILTER (
-            WHERE p.predicted_flip <> s.actual_observable_flip
-        )::numeric / COUNT(*),
-        6
-    ) AS logical_error_rate,
-    ROUND(
-        AVG(s.actual_observable_flip::int),
-        6
-    ) AS actual_logical_flip_rate
-FROM gold.google_experiment AS e
-JOIN gold.google_shot AS s
-    ON s.experiment_id = e.experiment_id
-JOIN gold.decoder_prediction AS p
-    ON p.shot_source_record_id = s.source_record_id
-JOIN gold.decoder AS d
-    ON d.decoder_name = p.decoder_name
-GROUP BY
-    e.distance,
-    e.center_row,
-    e.center_col,
-    d.decoder_name
-ORDER BY
-    e.distance,
-    e.center_row,
-    e.center_col,
-    logical_error_rate,
-    d.decoder_name;
-```
-For this question we joined together the tables `google_experiment`, `google_shot`, `decoder_prediction` and `decoder_prediction`. 
-The data shows that the decoders have different logic-error rates, and that their preformance varies with code distance and location. 
-The distance 3 results show that the decoder performance is not identical across the 4 locations. The observations from the experiments
-do not establish that processor location or code distance cause any change in performance for any of the decoders.
-## Q3 : How does the repetition-code circuit map data qubits to parity-check ancillas, syndrome bits, and conditional corrections? ##
-```sql
-SELECT
-    c.benchmark_name,
-    c.variant,
-    sc.check_id,
-    STRING_AGG(
-        cdq.data_qubit,
-        ', ' ORDER BY cdq.position
-    ) AS data_qubits,
-    sc.ancilla_qubit,
-    sc.syndrome_bit,
-    cc.condition_register,
-    cc.condition_value,
-    cc.gate,
-    cc.target_qubit
-FROM gold.circuit AS c
-JOIN gold.stabilizer_check AS sc
-    ON sc.circuit_id = c.circuit_id
-JOIN gold.check_data_qubit AS cdq
-    ON cdq.check_source_record_id = sc.source_record_id
-LEFT JOIN gold.conditional_correction AS cc
-    ON cc.circuit_id = c.circuit_id
-WHERE c.benchmark_name = 'qec_sm_n5'
-GROUP BY
-    c.benchmark_name,
-    c.variant,
-    sc.check_id,
-    sc.ancilla_qubit,
-    sc.syndrome_bit,
-    cc.condition_register,
-    cc.condition_value,
-    cc.gate,
-    cc.target_qubit
-ORDER BY
-    c.variant,
-    sc.check_id,
-    cc.condition_value;
-```
-The tables joined are `circuit`, `stabilizer_check`, `check_data_qubit` and `conditional_correction`. The qec_sm_n5 circuit 
-uses three data qubits and two parity-check ancillas. One check measures the parity of q[0] and q[1] into ancilla a[0] 
-and syndrome bit syn[0]. The other measures q[1] and q[2] into a[1] and syn[1]. The resulting two-bit syndrome controls 
-conditional X corrections for syndrome values 1, 2, and 3. Gold represents these relationships through circuit, 
-`stabilizer_check`, `check_data_qubit`, and `conditional_correction`, allowing the circuit structure to be queried without simulating it. 
+Generated by `make run` (stage `run_analyses`): each query in `sql/analysis/` runs against
+Gold and its result is saved next to this file as `<query>.csv`. Do not edit by hand.
+
+## Q1. How do weighted syndrome frequency and logical-error labels change with physical fault rate?
+
+Queries: `sql/analysis/q1_fault_rate_summary.sql` → `q1_fault_rate_summary.csv`, `sql/analysis/q1_by_fired_bits.sql` → `q1_by_fired_bits.csv`
+
+Across the seven simulated files (physical fault rate 1e-05 to 0.01; 10,000,000 weighted shots each), the weighted logical-error rate rises from 0.000234 to 0.186527. Over the same range the share of shots whose syndrome is all zeros falls from 99.87 % to 28.40 %, and the weighted mean number of fired syndrome bits rises from 0.002 to 1.825. The number of distinct syndromes grows from 68 to 31,466, and the number of syndromes seen with both labels from 0 to 18,210: at higher fault rates the same syndrome increasingly occurs both with and without a logical error, so a syndrome alone determines the label less and less. All rates are weighted by `quantity`. These are associations across seven simulation settings, not causal estimates.
+
+## Q2. How do the supplied decoder logical-error rates compare by code distance and distance-three processor location?
+
+Queries: `sql/analysis/q2_decoder_error_rates.sql` → `q2_decoder_error_rates.csv`
+
+At distance 3, the logical-error rate of each decoder varies across the 4 processor locations (belief_matching 0.388–0.416; correlated_matching 0.413–0.425; pymatching 0.430–0.443; tensor_network_contraction 0.384–0.413). The decoder with the lowest rate differs by location (centre 3_5: tensor_network_contraction, centre 5_3: tensor_network_contraction, centre 5_7: tensor_network_contraction, centre 7_5: belief_matching). At distance 5 (one experiment, centre 5_5) the rates range from 0.396 (tensor_network_contraction) to 0.451 (pymatching), similar to distance 3. The actual flip rate is between 0.490 and 0.500 everywhere: over 25 rounds the observable flips in about half of the shots, so all decoders stay near 0.4. With one distance-5 experiment, distance and location cannot be separated; the differences are associations between experiments, not effects of location or distance. This query joins four Gold tables (google_experiment, google_shot, decoder_prediction, decoder).
+
+## Q3. How does the repetition-code circuit map data qubits to parity-check ancillas, syndrome bits, and conditional corrections?
+
+Queries: `sql/analysis/q3_parity_checks.sql` → `q3_parity_checks.csv`, `sql/analysis/q3_corrections.sql` → `q3_corrections.csv`
+
+In `qec_sm_n5`, a[0] measures the parity of q[0], q[1] into syn[0]; a[1] measures the parity of q[1], q[2] into syn[1]. A correction is conditioned on the whole two-bit syndrome register, and bit k of its value is the syndrome bit written by check k: `syn = 1`: a[0] fires → `x q[0]`; `syn = 2`: a[1] fires → `x q[2]`; `syn = 3`: a[0] and a[1] fire → `x q[1]`. In every case the corrected qubit is the only data qubit that belongs to all fired checks and to no silent check — the flipped qubit the syndrome points to. The transpiled variant has the same mapping.
+
+## Rejected relationship: can QASMBench circuits be joined to the experiments?
+
+Queries: `sql/analysis/q4_rejected_relationship.sql` → `q4_rejected_relationship.csv`
+
+Six candidate join keys between QASMBench circuits and the Google or simulated experiments were tested; together they match 0 circuit rows. No identifier, name or qubit count links a circuit to an experiment, so the relationship is rejected and Gold has no foreign key between them.
