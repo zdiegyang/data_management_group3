@@ -1,31 +1,23 @@
-"""Part I pipeline stage: results/part1/trace_examples.json (R5).
+"""Part I demonstration: results/part1/trace_examples.json.
 
-Demonstrates the complete trace for one syndrome prediction and one Google
-prediction, per brief.md's "Source tracing" section:
+Brief: "Demonstrate the complete trace for one syndrome prediction and one
+Google prediction in trace_examples.json." Checklist: "Trace one syndrome
+prediction through ML, Gold, Silver, and Bronze" and "Trace one Google
+prediction to its shot and aligned Bronze members."
 
-    ML example_id -> Gold -> source_record_id -> source_trace.parquet row(s)
-    -> Bronze object / archive member / record locator / input_sha256
+Each trace starts from a real row of results/part2/predictions.parquet and
+follows the identifiers back, one hop at a time:
 
-The Google example additionally lists all 8 companion Bronze files for that
-shot (measurements.b8, sweep.b8, detection_events.b8, obs_flips_actual.01,
-and the 4 obs_flips_predicted_by_*.01 files) -- one shot's record is
-assembled from several aligned companion members that all share one
-source_record_id (silver-tables.md).
+    prediction (example_id, model_id)
+      -> ML table row                      (ml/*.parquet, by example_id)
+      -> Gold record(s)                    (gold.v_ml_example_gold_record)
+      -> Silver row                        (silver/*.parquet, by source_record_id)
+      -> source_trace.parquet row(s)       (by source_record_id)
+      -> Bronze object, member, position, SHA-256
+         (hash checked against the verified input hash in results/part1/run.json)
 
-Run this after load_postgres (Gold, including sql/ml_syndrome_example.sql
-and sql/ml_google_example.sql, must already be loaded). It is part of the
-ordinary pipeline, not a notebook: call `run(run_id, settings)` from
-wherever the other stages (load_postgres, etc.) are orchestrated, or run
-this file directly for a one-off build.
-
-Idempotent / self-healing: if the chosen Google shot's 8 companion-file rows
-are not yet in source_trace.parquet (e.g. the Silver google_qec stage only
-wrote experiment-level trace rows so far), this stage adds exactly those 8
-rows itself via the supplied save_source_traces helper (dedup'd by
-(source_record_id, archive_member, record_locator), so reruns never
-duplicate them) and then proceeds. It does not touch any other shot's trace
-rows -- backfilling the other 249,999 shots is the Silver stage's job, not
-this one's.
+It needs Part II's predictions, so it runs after `make train` (`make trace`).
+It only reads; it never writes to Bronze, Silver, Gold or source_trace.
 """
 from __future__ import annotations
 
@@ -35,231 +27,172 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from quantum_lake_student.config import Settings
 from quantum_lake_student.connections import minio_client
 from quantum_lake_student.models import StageResult
-from quantum_lake_student.tracing import save_source_traces
 
-PROJECT = Path(__file__).resolve().parents[3]  # starter/
-RESULTS = PROJECT / "results/part1"
-TRACE_LOCAL = RESULTS / "source_trace.parquet"
-TRACE_KEY = "results/part1/source_trace.parquet"  # object key inside the bucket
+PROJECT = Path(__file__).resolve().parents[2]  # starter/
+RESULTS = PROJECT / "results" / "part1"
+PREDICTIONS = PROJECT / "results" / "part2" / "predictions.parquet"
 
-# Deterministic example picks, so trace_examples.json is stable across reruns:
-#  - syndrome: row 0 of the lowest-fault-rate experiment file.
-#  - google: surface_code_bX_d3_r25_center_3_5 shot 0 -- the exact shot
-#    docs/decision_log.md documents as a verified, checked, non-trivial
-#    example (27 fired detectors, actual_observable_flip=1).
-SYNDROME_SOURCE_RECORD_ID = "qec_syndromes:d-3_pfr-0.000010_nb-10M.csv:row:0"
-GOOGLE_EXPERIMENT_ID = "surface_code_bX_d3_r25_center_3_5"
-GOOGLE_SHOT_INDEX = 0
-GOOGLE_SOURCE_RECORD_ID = f"google_qec:{GOOGLE_EXPERIMENT_ID}:shot:{GOOGLE_SHOT_INDEX}"
+# Fixed, test-split examples so the file is identical on every run.
+TRACES = {
+    "syndrome_prediction_trace": {
+        "model_id": "task_a_logistic",
+        "source_record_id": "qec_syndromes:d-3_pfr-0.005000_nb-10M.csv:row:0",
+        "ml_key": "ml/ml_syndrome_decoder_example.parquet",
+        "ml_view": "gold.v_ml_syndrome_decoder_example",
+        "silver_key": "silver/qec_syndromes/syndrome_observation.parquet",
+    },
+    "google_prediction_trace": {
+        "model_id": "task_b_d3_combined",
+        "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+        "ml_key": "ml/ml_google_decoder_example.parquet",
+        "ml_view": "gold.v_ml_google_decoder_example",
+        "silver_key": "silver/google_qec/shot.parquet",
+    },
+}
+TRACE_KEY = "results/part1/source_trace.parquet"
+GOLD_ROW_QUERIES = {
+    "syndrome_observation": "SELECT * FROM gold.syndrome_observation WHERE source_record_id = %s",
+    "google_shot": "SELECT * FROM gold.google_shot WHERE source_record_id = %s",
+    "decoder_prediction": (
+        "SELECT * FROM gold.decoder_prediction WHERE shot_source_record_id = %s ORDER BY decoder_name"
+    ),
+}
 
-GOOGLE_BRONZE_OBJECT = "bronze/source=google_qec/google-surface-code-curated.zip"
-GOOGLE_COMPANION_FILES = [
-    "measurements.b8",
-    "sweep.b8",
-    "detection_events.b8",
-    "obs_flips_actual.01",
-    "obs_flips_predicted_by_belief_matching.01",
-    "obs_flips_predicted_by_correlated_matching.01",
-    "obs_flips_predicted_by_pymatching.01",
-    "obs_flips_predicted_by_tensor_network_contraction.01",
-]
+
+class TraceError(RuntimeError):
+    """A hop of a trace cannot be resolved; the demonstration must not be published."""
 
 
-def _read_trace_table(settings: Settings):
-    """Read source_trace.parquet from wherever the Silver stage put it."""
-    if settings.lake_backend == "minio":
-        client = minio_client(settings)
-        response = client.get_object(settings.s3_bucket, TRACE_KEY)
-        try:
-            return pq.read_table(io.BytesIO(response.read())).to_pandas()
-        finally:
-            response.close()
-            response.release_conn()
-    if TRACE_LOCAL.exists():
-        return pq.read_table(TRACE_LOCAL).to_pandas()
-    raise FileNotFoundError(
-        f"{TRACE_LOCAL} not found. Run the Silver stage(s) first -- they "
-        "must write results/part1/source_trace.parquet before this stage can run."
+def _plain(value: Any) -> Any:
+    """JSON-friendly values: packed bytes as hex, everything else unchanged."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return value
+
+
+def _row(record: dict[str, Any]) -> dict[str, Any]:
+    return {key: _plain(value) for key, value in record.items()}
+
+
+def _read_lake_table(settings: Settings, key: str):
+    if settings.lake_backend == "local":
+        return pq.read_table(settings.local_lake_root / key)
+    response = minio_client(settings).get_object(settings.s3_bucket, key)
+    try:
+        return pq.read_table(io.BytesIO(response.read()))
+    finally:
+        response.close()
+        response.release_conn()
+
+
+def _rows_where(table, column: str, value: str) -> list[dict[str, Any]]:
+    return table.filter(pc.equal(table[column], value)).to_pylist()
+
+
+def _one(rows: list[dict[str, Any]], what: str) -> dict[str, Any]:
+    if len(rows) != 1:
+        raise TraceError(f"expected exactly one {what}, found {len(rows)}")
+    return rows[0]
+
+
+def _query(conn: psycopg.Connection, sql: str, value: str) -> list[dict[str, Any]]:
+    cursor = conn.execute(sql, (value,))
+    columns = [column.name for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def build_trace(
+    spec: dict[str, str],
+    conn: psycopg.Connection,
+    predictions,
+    trace_table,
+    lake_tables: dict[str, Any],
+    verified_hashes: dict[str, str],
+) -> dict[str, Any]:
+    """Follow one prediction back to the Bronze bytes it came from."""
+    source_record_id = spec["source_record_id"]
+
+    # Gold: which ML example was built from this source record.
+    example = _one(_query(conn, f"SELECT example_id FROM {spec['ml_view']} WHERE source_record_id = %s",
+                          source_record_id), f"ML example for {source_record_id}")
+    example_id = example["example_id"]
+
+    # 1. The prediction itself (Part II output).
+    prediction = _one(
+        [row for row in _rows_where(predictions, "example_id", example_id) if row["model_id"] == spec["model_id"]],
+        f"{spec['model_id']} prediction for {example_id}",
     )
-
-
-def _trace_rows_for(trace_df, source_record_id: str) -> list[dict[str, Any]]:
-    rows = trace_df[trace_df["source_record_id"] == source_record_id]
-    return [
-        {
-            "source_record_id": r.source_record_id,
-            "source_name": r.source_name,
-            "bronze_object": r.bronze_object,
-            "archive_member": r.archive_member,
-            "record_locator": r.record_locator,
-            "input_sha256": r.input_sha256,
-        }
-        for r in rows.itertuples()
+    # 2. The ML input row it was made from.
+    ml_row = _one(_rows_where(lake_tables[spec["ml_key"]], "example_id", example_id), f"ML row {example_id}")
+    # 3. The Gold record(s) the ML row was built from.
+    links = _query(conn, "SELECT gold_table, source_record_id, decoder_name FROM gold.v_ml_example_gold_record "
+                         "WHERE example_id = %s ORDER BY gold_table, decoder_name", example_id)
+    if not links:
+        raise TraceError(f"{example_id} does not resolve to any Gold record")
+    gold_records = {table: [_row(r) for r in _query(conn, GOLD_ROW_QUERIES[table], source_record_id)]
+                    for table in sorted({link["gold_table"] for link in links})}
+    # 4. The Silver row.
+    silver_row = _one(_rows_where(lake_tables[spec["silver_key"]], "source_record_id", source_record_id),
+                      f"Silver row {source_record_id}")
+    # 5. The source trace rows and 6. the Bronze object they point to.
+    trace_rows = sorted(_rows_where(trace_table, "source_record_id", source_record_id),
+                        key=lambda row: row["archive_member"])
+    if not trace_rows:
+        raise TraceError(f"{source_record_id} has no row in source_trace.parquet")
+    bronze_objects = {(row["bronze_object"], row["input_sha256"]) for row in trace_rows}
+    bronze = [
+        {"object": obj, "sha256": sha, "matches_verified_input_hash": verified_hashes.get(obj) == sha}
+        for obj, sha in sorted(bronze_objects)
     ]
+    if not all(item["matches_verified_input_hash"] for item in bronze):
+        raise TraceError(f"{source_record_id}: Bronze hash differs from the hash verified in run.json")
 
-
-def _ensure_google_shot_trace(trace_df, settings: Settings):
-    """Add the 8 companion-file trace rows for the one demo shot if missing."""
-    existing = trace_df[trace_df["source_record_id"] == GOOGLE_SOURCE_RECORD_ID]
-    if len(existing) >= len(GOOGLE_COMPANION_FILES):
-        return trace_df
-
-    google_rows = trace_df[trace_df["source_name"] == "google_qec"]
-    if google_rows.empty:
-        raise RuntimeError(
-            "No google_qec rows in source_trace.parquet yet -- run the "
-            "Silver google_qec stage first (it must trace at least the "
-            "experiment-level properties.yml records)."
-        )
-    sha256 = str(google_rows.iloc[0]["input_sha256"])
-
-    new_records = [
-        {
-            "source_record_id": GOOGLE_SOURCE_RECORD_ID,
-            "source_name": "google_qec",
-            "bronze_object": GOOGLE_BRONZE_OBJECT,
-            "archive_member": f"{GOOGLE_EXPERIMENT_ID}/{fname}",
-            "record_locator": str(GOOGLE_SHOT_INDEX),
-            "input_sha256": sha256,
-        }
-        for fname in GOOGLE_COMPANION_FILES
-    ]
-    save_source_traces(
-        new_records,
-        source_name="google_qec",
-        trace_file_path=TRACE_LOCAL,
-        settings=settings,
-    )
-    return pq.read_table(TRACE_LOCAL).to_pandas()
-
-
-def run(run_id: str) -> StageResult:
-    settings = Settings.from_environment()
-
-    result = StageResult(stage="build_trace_examples", run_id=run_id)
-
-    trace_df = _read_trace_table(settings)
-    trace_df = _ensure_google_shot_trace(trace_df, settings)
-
-    with psycopg.connect(settings.postgres_dsn) as conn:
-        syn_row = conn.execute(
-            """
-            SELECT example_id,
-                   experiment_id,
-                   physical_fault_rate,
-                   logical_error_label,
-                   sample_weight,
-                   source_record_id
-            FROM gold.v_ml_syndrome_decoder_example
-            WHERE source_record_id = %s
-            """,
-            (SYNDROME_SOURCE_RECORD_ID,),
-        ).fetchone()
-        if syn_row is None:
-            raise RuntimeError(
-                f"{SYNDROME_SOURCE_RECORD_ID} not found in "
-                "gold.v_ml_syndrome_decoder_example -- run load_postgres and "
-                "sql/ml_syndrome_example.sql first."
-            )
-        syn_example = dict(zip(
-            ["example_id", "experiment_id", "physical_fault_rate",
-             "logical_error_label", "sample_weight", "source_record_id"],
-            syn_row,
-        ))
-
-        google_row = conn.execute(
-            """
-            SELECT example_id,
-                   experiment_id,
-                   shot_index,
-                   distance,
-                   detector_event_count,
-                   actual_observable_flip,
-                   source_record_id
-            FROM gold.v_ml_google_decoder_example
-            WHERE source_record_id = %s
-            """,
-            (GOOGLE_SOURCE_RECORD_ID,),
-        ).fetchone()
-        if google_row is None:
-            raise RuntimeError(
-                f"{GOOGLE_SOURCE_RECORD_ID} not found in "
-                "gold.v_ml_google_decoder_example -- run load_postgres and "
-                "sql/ml_google_example.sql first."
-            )
-        google_example = dict(zip(
-            ["example_id", "experiment_id", "shot_index", "distance",
-             "detector_event_count", "actual_observable_flip",
-             "source_record_id"],
-            google_row,
-        ))
-
-    syn_trace = _trace_rows_for(trace_df, SYNDROME_SOURCE_RECORD_ID)
-    google_trace = _trace_rows_for(trace_df, GOOGLE_SOURCE_RECORD_ID)
-
-    if not syn_trace:
-        raise RuntimeError(f"{SYNDROME_SOURCE_RECORD_ID} has no source_trace.parquet row.")
-    if len(google_trace) != len(GOOGLE_COMPANION_FILES):
-        raise RuntimeError(
-            f"expected {len(GOOGLE_COMPANION_FILES)} companion-file trace rows "
-            f"for {GOOGLE_SOURCE_RECORD_ID}, found {len(google_trace)}."
-        )
-
-    output = {
-        "syndrome_prediction_trace": {
-            "description": (
-                "example_id -> gold.syndrome_observation (via source_record_id) "
-                "-> source_trace.parquet -> Bronze qec_syndromes CSV."
-            ),
-            "ml_example": syn_example,
-            "gold": {
-                "table": "gold.syndrome_observation",
-                "source_record_id": SYNDROME_SOURCE_RECORD_ID,
-            },
-            "source_trace_rows": syn_trace,
-        },
-        "google_prediction_trace": {
-            "description": (
-                "example_id -> gold.google_shot (via source_record_id) -> "
-                "source_trace.parquet -> all 8 aligned Bronze companion "
-                "members for this shot (one source_trace row per companion "
-                "file, sharing one source_record_id)."
-            ),
-            "ml_example": google_example,
-            "gold": {
-                "table": "gold.google_shot",
-                "source_record_id": GOOGLE_SOURCE_RECORD_ID,
-            },
-            "source_trace_rows": google_trace,
-            "companion_file_count": len(google_trace),
-        },
+    return {
+        "path": "prediction -> ML row -> Gold record(s) -> Silver row -> source_trace -> Bronze",
+        "1_prediction": {"file": "results/part2/predictions.parquet", "row": _row(prediction)},
+        "2_ml_row": {"table": spec["ml_key"], "row": _row(ml_row)},
+        "3_gold": {"view": "gold.v_ml_example_gold_record", "links": [_row(link) for link in links],
+                   "records": gold_records},
+        "4_silver_row": {"table": spec["silver_key"], "row": _row(silver_row)},
+        "5_source_trace": {"table": TRACE_KEY, "rows": [_row(row) for row in trace_rows]},
+        "6_bronze": {"objects": bronze,
+                     "members": [{"archive_member": row["archive_member"],
+                                  "record_locator": row["record_locator"]} for row in trace_rows]},
     }
 
+
+def run(run_id: str, settings: Settings | None = None) -> StageResult:
+    settings = settings or Settings.from_environment()
+    result = StageResult(stage="build_trace_examples", run_id=run_id)
+
+    if not PREDICTIONS.exists():
+        raise TraceError(f"{PREDICTIONS} not found: run `make train` before `make trace`")
+    run_record = json.loads((RESULTS / "run.json").read_text(encoding="utf-8"))
+    predictions = pq.read_table(PREDICTIONS)
+    trace_table = _read_lake_table(settings, TRACE_KEY)
+    lake_tables = {key: _read_lake_table(settings, key)
+                   for spec in TRACES.values() for key in (spec["ml_key"], spec["silver_key"])}
+
+    output = {}
+    with psycopg.connect(settings.postgres_dsn) as conn:
+        for name, spec in TRACES.items():
+            output[name] = build_trace(spec, conn, predictions, trace_table, lake_tables,
+                                       run_record.get("input_hashes", {}))
+
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out_path = RESULTS / "trace_examples.json"
-    out_path.write_text(json.dumps(output, indent=2, default=str))
-
+    path = RESULTS / "trace_examples.json"
+    path.write_text(json.dumps(output, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     if settings.lake_backend == "minio":
-        try:
-            minio_client(settings).fput_object(
-                settings.s3_bucket, "results/part1/trace_examples.json", str(out_path),
-            )
-        except Exception:
-            pass
+        minio_client(settings).fput_object(settings.s3_bucket, "results/part1/trace_examples.json", str(path))
 
-    result.input_count = 2
-    result.output_count = len(syn_trace) + len(google_trace)
-    result.issue_count = 0
+    result.input_count = len(TRACES)
+    result.output_count = sum(len(trace["5_source_trace"]["rows"]) for trace in output.values())
+    result.details["trace_examples"] = str(path)
     result.finish()
     return result
-
-
-# if __name__ == "__main__":
-#     r = run("manual-build-trace-examples")
-#     print(f"wrote results/part1/trace_examples.json "
-#           f"({r.output_count} trace rows across {r.input_count} examples)")

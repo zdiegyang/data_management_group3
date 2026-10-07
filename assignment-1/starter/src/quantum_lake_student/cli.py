@@ -224,11 +224,6 @@ def _run_part1_stages(
         f"{gold_measure.input_count:,} inputs -> {gold_measure.output_count:,} outputs "
         f"({gold_measure.issue_count} issues) in {duration:.2f}s"
     )
-    # # build trace
-    # trace = build_trace.run(run_id=run_id)
-    # stage_results.append(trace)
-    # console.print("[bold green]✓ build_trace.json examples")
-
     console.print("[bold green]✓ Part I PostgreSQL storage measured and saved as JSON![/bold green]")
 
     # Stage 4: Gold -> ML. Reads only Gold views; writes both ML tables to the lake.
@@ -268,11 +263,27 @@ def command_train(settings: Settings) -> int:
     return 0
 
 
+def command_trace(settings: Settings) -> int:
+    """Part I demonstration, run after `make train`: trace one syndrome and one
+    Google prediction back to Bronze into results/part1/trace_examples.json.
+
+    Kept out of `make train` because Part II may read only the two ML tables,
+    while a trace must read Gold, Silver and the source trace.
+    """
+    run_id = f"trace_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    result = build_trace.run(run_id=run_id, settings=settings)
+    console.print(
+        f"[green]✓ Trace examples:[/green] {result.input_count} predictions traced to "
+        f"{result.output_count} Bronze trace rows -> {result.details['trace_examples']}"
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument(
         "command",
-        choices=("check", "inventory", "run", "train"),
+        choices=("check", "inventory", "run", "train", "trace"),
         help="Action to perform",
     )
     return result
@@ -286,6 +297,7 @@ def main() -> None:
         "inventory": command_inventory,
         "run": command_run,
         "train": command_train,
+        "trace": command_trace,
     }
     raise SystemExit(commands[arguments.command](settings))
 

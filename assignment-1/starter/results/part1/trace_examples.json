@@ -1,0 +1,331 @@
+{
+  "google_prediction_trace": {
+    "1_prediction": {
+      "file": "results/part2/predictions.parquet",
+      "row": {
+        "example_id": "6a814811704205eb279f1cd28b909f4fcdddce34edf8efa2979c2a4c5f05b75c",
+        "label": true,
+        "model_id": "task_b_d3_combined",
+        "prediction": true,
+        "probability": 0.5548652744812728,
+        "split": "test"
+      }
+    },
+    "2_ml_row": {
+      "row": {
+        "actual_observable_flip": true,
+        "belief_matching_prediction": true,
+        "center_col": 5,
+        "center_row": 3,
+        "correlated_matching_prediction": false,
+        "data_split": "test",
+        "detector_bits": "b38060438084010d080410000684000e300040400002222000",
+        "detector_count": 200,
+        "detector_event_count": 36,
+        "distance": 3,
+        "example_id": "6a814811704205eb279f1cd28b909f4fcdddce34edf8efa2979c2a4c5f05b75c",
+        "experiment_id": "surface_code_bX_d3_r25_center_3_5",
+        "pymatching_prediction": false,
+        "rounds": 25,
+        "shot_index": 1,
+        "tensor_network_contraction_prediction": true
+      },
+      "table": "ml/ml_google_decoder_example.parquet"
+    },
+    "3_gold": {
+      "links": [
+        {
+          "decoder_name": "belief_matching",
+          "gold_table": "decoder_prediction",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+        },
+        {
+          "decoder_name": "correlated_matching",
+          "gold_table": "decoder_prediction",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+        },
+        {
+          "decoder_name": "pymatching",
+          "gold_table": "decoder_prediction",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+        },
+        {
+          "decoder_name": "tensor_network_contraction",
+          "gold_table": "decoder_prediction",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+        },
+        {
+          "decoder_name": null,
+          "gold_table": "google_shot",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+        }
+      ],
+      "records": {
+        "decoder_prediction": [
+          {
+            "decoder_name": "belief_matching",
+            "predicted_flip": true,
+            "shot_source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+          },
+          {
+            "decoder_name": "correlated_matching",
+            "predicted_flip": false,
+            "shot_source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+          },
+          {
+            "decoder_name": "pymatching",
+            "predicted_flip": false,
+            "shot_source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+          },
+          {
+            "decoder_name": "tensor_network_contraction",
+            "predicted_flip": true,
+            "shot_source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1"
+          }
+        ],
+        "google_shot": [
+          {
+            "actual_observable_flip": true,
+            "detector_bits": "b38060438084010d080410000684000e300040400002222000",
+            "detector_event_count": 36,
+            "experiment_id": "surface_code_bX_d3_r25_center_3_5",
+            "measurement_bits": "ac02af3c9d70cdb89d78dd79bc59f4b114b217b6179217b0176201",
+            "shot_index": 1,
+            "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+            "sweep_bits": "d000"
+          }
+        ]
+      },
+      "view": "gold.v_ml_example_gold_record"
+    },
+    "4_silver_row": {
+      "row": {
+        "actual_observable_flip": true,
+        "belief_matching_prediction": true,
+        "correlated_matching_prediction": false,
+        "detector_bits": "b38060438084010d080410000684000e300040400002222000",
+        "detector_event_count": 36,
+        "experiment_id": "surface_code_bX_d3_r25_center_3_5",
+        "measurement_bits": "ac02af3c9d70cdb89d78dd79bc59f4b114b217b6179217b0176201",
+        "pymatching_prediction": false,
+        "shot_index": 1,
+        "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+        "sweep_bits": "d000",
+        "tensor_network_contraction_prediction": true
+      },
+      "table": "silver/google_qec/shot.parquet"
+    },
+    "5_source_trace": {
+      "rows": [
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/detection_events.b8",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "shot:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/measurements.b8",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "shot:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_actual.01",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "line:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_belief_matching.01",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "line:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_correlated_matching.01",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "line:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_pymatching.01",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "line:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_tensor_network_contraction.01",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "line:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/sweep.b8",
+          "bronze_object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "input_sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56",
+          "record_locator": "shot:1",
+          "source_name": "google_qec",
+          "source_record_id": "google_qec:surface_code_bX_d3_r25_center_3_5:shot:1",
+          "valid": "yes"
+        }
+      ],
+      "table": "results/part1/source_trace.parquet"
+    },
+    "6_bronze": {
+      "members": [
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/detection_events.b8",
+          "record_locator": "shot:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/measurements.b8",
+          "record_locator": "shot:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_actual.01",
+          "record_locator": "line:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_belief_matching.01",
+          "record_locator": "line:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_correlated_matching.01",
+          "record_locator": "line:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_pymatching.01",
+          "record_locator": "line:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/obs_flips_predicted_by_tensor_network_contraction.01",
+          "record_locator": "line:1"
+        },
+        {
+          "archive_member": "surface_code_bX_d3_r25_center_3_5/sweep.b8",
+          "record_locator": "shot:1"
+        }
+      ],
+      "objects": [
+        {
+          "matches_verified_input_hash": true,
+          "object": "bronze/source=google_qec/google-surface-code-curated.zip",
+          "sha256": "5d6a24f89f055883a49910979490be4baef54d28bf9a0f8e096a1d6c46d1ea56"
+        }
+      ]
+    },
+    "path": "prediction -> ML row -> Gold record(s) -> Silver row -> source_trace -> Bronze"
+  },
+  "syndrome_prediction_trace": {
+    "1_prediction": {
+      "file": "results/part2/predictions.parquet",
+      "row": {
+        "example_id": "8b837d206df02cb253f7c1d5a882aa20be42460af68eaa80cd07a31107c44b8b",
+        "label": false,
+        "model_id": "task_a_logistic",
+        "prediction": false,
+        "probability": 0.01742123068017273,
+        "split": "test"
+      }
+    },
+    "2_ml_row": {
+      "row": {
+        "check_count": 4,
+        "data_split": "test",
+        "example_id": "8b837d206df02cb253f7c1d5a882aa20be42460af68eaa80cd07a31107c44b8b",
+        "experiment_id": "d-3_pfr-0.005000_nb-10M",
+        "logical_error_label": false,
+        "physical_fault_rate": 0.005,
+        "round_count": 4,
+        "sample_weight": 5309458,
+        "syndrome_bits": "00000000000000000000000000000000"
+      },
+      "table": "ml/ml_syndrome_decoder_example.parquet"
+    },
+    "3_gold": {
+      "links": [
+        {
+          "decoder_name": null,
+          "gold_table": "syndrome_observation",
+          "source_record_id": "qec_syndromes:d-3_pfr-0.005000_nb-10M.csv:row:0"
+        }
+      ],
+      "records": {
+        "syndrome_observation": [
+          {
+            "experiment_id": "d-3_pfr-0.005000_nb-10M",
+            "logical_error_label": false,
+            "quantity": 5309458,
+            "source_record_id": "qec_syndromes:d-3_pfr-0.005000_nb-10M.csv:row:0",
+            "syndrome_bits": "00000000000000000000000000000000"
+          }
+        ]
+      },
+      "view": "gold.v_ml_example_gold_record"
+    },
+    "4_silver_row": {
+      "row": {
+        "check_count": 4,
+        "experiment_id": "d-3_pfr-0.005000_nb-10M",
+        "logical_error_label": false,
+        "physical_fault_rate": 0.005,
+        "quantity": 5309458,
+        "round_count": 4,
+        "source_record_id": "qec_syndromes:d-3_pfr-0.005000_nb-10M.csv:row:0",
+        "syndrome_bits": "00000000000000000000000000000000"
+      },
+      "table": "silver/qec_syndromes/syndrome_observation.parquet"
+    },
+    "5_source_trace": {
+      "rows": [
+        {
+          "archive_member": "d-3_pfr-0.005000_nb-10M.csv",
+          "bronze_object": "bronze/source=qec_syndromes/syndromes_dataset.zip",
+          "input_sha256": "bdfce36a71f04295ac78fb372d9c2e381801c05e3be119f919750ef59026d072",
+          "record_locator": "row:0",
+          "source_name": "qec_syndromes",
+          "source_record_id": "qec_syndromes:d-3_pfr-0.005000_nb-10M.csv:row:0",
+          "valid": "yes"
+        }
+      ],
+      "table": "results/part1/source_trace.parquet"
+    },
+    "6_bronze": {
+      "members": [
+        {
+          "archive_member": "d-3_pfr-0.005000_nb-10M.csv",
+          "record_locator": "row:0"
+        }
+      ],
+      "objects": [
+        {
+          "matches_verified_input_hash": true,
+          "object": "bronze/source=qec_syndromes/syndromes_dataset.zip",
+          "sha256": "bdfce36a71f04295ac78fb372d9c2e381801c05e3be119f919750ef59026d072"
+        }
+      ]
+    },
+    "path": "prediction -> ML row -> Gold record(s) -> Silver row -> source_trace -> Bronze"
+  }
+}
