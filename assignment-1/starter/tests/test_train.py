@@ -232,6 +232,37 @@ def test_metrics_match_hand_computed_values():
     assert evaluation._metrics(labels, predictions, None)["brier_score"] is None
 
 
+# --- report ---------------------------------------------------------------------------------
+
+def test_report_covers_every_required_topic():
+    from quantum_lake_student.stages.part2_outputs import _report_markdown
+    from quantum_lake_student.stages.train import _positive_weight_share
+
+    syndrome, google = _syndrome_rows(), _google_rows()
+    for row in google[:60]:  # a distance-5 copy so both distances exist
+        google.append(dict(row, example_id=row["example_id"] + "-d5", distance=5))
+    metrics, diagnostics = {}, {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        metrics.update(tasks._run_task_a(syndrome)[1])
+        for distance in (3, 5):
+            _, task_metrics, _, task_diagnostics = tasks._run_task_b_distance(google, distance)
+            metrics.update(task_metrics)
+            diagnostics[f"task_b_d{distance}"] = task_diagnostics
+        _, task_metrics, _, diagnostics["task_c"] = tasks._run_task_c(google)
+        metrics.update(task_metrics)
+    diagnostics["task_a"] = {"positive_weight_share": _positive_weight_share(syndrome)}
+
+    report = _report_markdown(metrics, diagnostics, {"syndrome": len(syndrome), "google": len(google)})
+
+    # Spec: "the inputs and targets, why each simple model fits its table,
+    # results, discarded information, and limitations".
+    for heading in ("## Inputs and targets", "## Why each simple model fits its table",
+                    "## Task A", "## Task B", "## Task C", "## Discarded information",
+                    "## Limitations", "What a flat 200-bit vector does not show"):
+        assert heading in report
+
+
 # --- repeatability ----------------------------------------------------------------------
 
 def test_tasks_are_repeatable():

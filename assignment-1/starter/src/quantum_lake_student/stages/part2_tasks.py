@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
+from sklearn.metrics import balanced_accuracy_score
 from sklearn.neural_network import MLPClassifier
 
 from quantum_lake_student.ml import (
@@ -55,13 +56,15 @@ def _run_task_a(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[
         split_rows = by_split[split]
         y = np.asarray([bool(row["logical_error_label"]) for row in split_rows])
         weights = np.asarray([float(row["sample_weight"]) for row in split_rows])
+        start = perf_counter()
         pred, prob = _constant_predictions(prior, len(split_rows))
+        prediction_time = perf_counter() - start
         prior_predictions.extend(_prediction_records(split_rows, "task_a_prior", pred, prob))
         if split == TEST_SPLIT:
             prior_metrics = _metrics(y, pred, prob, weights)
+            prior_metrics["prediction_time_seconds"] = prediction_time
     prior_metrics["positive_prior"] = prior
     prior_metrics["training_time_seconds"] = 0.0
-    prior_metrics["prediction_time_seconds"] = None
 
     x_train = np.asarray([syndrome_model_input(row["syndrome_bits"]) for row in train], dtype=float)
     x_validation = np.asarray([syndrome_model_input(row["syndrome_bits"]) for row in validation], dtype=float)
@@ -226,6 +229,9 @@ def _run_task_b_distance(
     return predictions, metrics, {combined_id: artifact}, diagnostics
 
 
+MLP_MAX_ITER = 200
+
+
 def _detector_features(row: dict[str, Any]) -> np.ndarray:
     """The 200 unpacked detector bits of one distance-3 shot, in detector order.
 
@@ -267,13 +273,18 @@ def _run_task_c(
     y_validation = np.asarray([bool(row["actual_observable_flip"]) for row in by_split[VALIDATION_SPLIT]])
 
     start = perf_counter()
+    # Early stopping holds back 10 % of the *training* rows to decide when to
+    # stop (validation and test are untouched). Without it the network fits the
+    # training shots (balanced accuracy > 0.8) while staying at chance on test,
+    # and stops at max_iter without converging.
     model = MLPClassifier(
         hidden_layer_sizes=(32,),
         activation="relu",
         solver="adam",
-        max_iter=100,
+        max_iter=MLP_MAX_ITER,
         random_state=SEED,
-        early_stopping=False,
+        early_stopping=True,
+        validation_fraction=0.1,
     )
     model.fit(x_train, y_train)
     training_time = perf_counter() - start
@@ -309,9 +320,13 @@ def _run_task_c(
         "seed": SEED,
         "subset": "distance = 3 AND shot_index < 12500",
     }
+    train_prediction = model.predict_proba(x_train)[:, 1] >= threshold
     diagnostics = {
         "subset_rows": len(subset),
         "subset_rows_by_split": {split: len(by_split[split]) for split in REQUIRED_SPLITS},
         "test_prediction_time_seconds": test_prediction_time,
+        "mlp_iterations": int(model.n_iter_),
+        "mlp_converged": bool(model.n_iter_ < MLP_MAX_ITER),
+        "train_balanced_accuracy": float(balanced_accuracy_score(y_train, train_prediction)),
     }
     return predictions, {model_id: test_metrics}, {model_id: artifact}, diagnostics

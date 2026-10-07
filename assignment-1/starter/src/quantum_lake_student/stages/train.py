@@ -37,6 +37,16 @@ from .part2_tasks import _run_task_a, _run_task_b_distance, _run_task_c
 from quantum_lake_student.ml import GOOGLE_META_PREDICTION_COLUMNS
 
 
+def _positive_weight_share(rows: list[dict]) -> dict[str, float]:
+    """Physically weighted share of logical errors per supplied split (Task A imbalance)."""
+    share = {}
+    for split in ("train", "validation", "test"):
+        split_rows = [row for row in rows if row["data_split"] == split]
+        total = sum(row["sample_weight"] for row in split_rows)
+        share[split] = sum(row["sample_weight"] for row in split_rows if row["logical_error_label"]) / total
+    return share
+
+
 def run(model_run_id: str, settings: Settings | None = None) -> StageResult:
     """Run all required Part II tasks and publish ``results/part2``."""
     settings = settings or Settings.from_environment()
@@ -66,6 +76,7 @@ def run(model_run_id: str, settings: Settings | None = None) -> StageResult:
     all_predictions.extend(predictions)
     all_metrics.update(metrics)
     all_artifacts.update(artifacts)
+    diagnostics["task_a"] = {"positive_weight_share": _positive_weight_share(syndrome_rows)}
 
     for distance in (3, 5):
         predictions, metrics, artifacts, task_diagnostics = _run_task_b_distance(
