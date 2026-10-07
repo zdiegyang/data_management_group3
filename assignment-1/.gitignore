@@ -16,5 +16,13 @@ starter/silver/**/*.parquet
 starter/results/part1/*
 !starter/results/part1/README.md
 
+# Generated Part 2 results: `make train` regenerates models, predictions,
+# metrics, run.json and report.md (brief: do not commit large model files)
+starter/results/part2/
+
+# Course data archives are supplied separately (checklist: "Course archives
+# ... are not committed"). Place them here locally before `make bootstrap`.
+datasets/student-bundle/core/raw/
+
 # Jupyter notebook checkpoints
 **/.ipynb_checkpoints/
