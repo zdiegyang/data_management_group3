@@ -8,9 +8,21 @@ import pyarrow.parquet as pq
 import pytest
 import zipfile
 
+from quantum_lake_student.config import Settings
+from quantum_lake_student.connections import minio_client
 from quantum_lake_student.formats import b8_record_bytes, iter_b8_records
 from quantum_lake_student.stages import prepare_data
 from quantum_lake_student.tracing import SOURCE_TRACE_SCHEMA, save_source_traces
+
+def _read_table_from_minio(client, bucket: str, object_name: str):
+    """Fetch parquet object from MinIO and load it into a PyArrow Table in memory."""
+    response = client.get_object(bucket, object_name)
+    try:
+        data = response.read()
+    finally:
+        response.close()
+        response.release_conn()
+    return pq.read_table(io.BytesIO(data))
 
 
 def test_failed_prepare_run_records_failure_and_reraises(tmp_path, monkeypatch):
@@ -345,7 +357,8 @@ def test_google_shot_missing_companion_file_stops_run():
 
 def test_prepare_data_stage_execution():
     """Verify that Stage 2 runs end-to-end, producing verified Silver tables and traces."""
-    res = prepare_data.run("test_verification_run")
+    settings = Settings.from_environment()
+    res = prepare_data.run("test_verification_run", settings=settings)
 
     assert res.stage == "prepare_data"
     assert res.finished_at is not None
@@ -356,8 +369,10 @@ def test_prepare_data_stage_execution():
     # (warnings and notes, nothing excluded) — checked in detail below.
     assert res.issue_count == 21
 
+    client = minio_client(settings)
+    bucket = settings.s3_bucket
+
     base_dir = Path(__file__).resolve().parents[1]
-    silver_dir = base_dir / "silver"
     results_dir = base_dir / "results/part1"
 
     row_counts_file = results_dir / "row_counts.json"
@@ -379,7 +394,9 @@ def test_prepare_data_stage_execution():
         assert counts["unit"] == unit
         assert counts["rows_read"] == counts["rows_loaded"]
         assert counts["source_files_read"] >= counts["source_files_rejected"]
-        assert counts["rows_loaded"] == pq.read_table(silver_dir / "qasmbench" / f"{table_name}.parquet").num_rows
+
+        t_qasm_mem = _read_table_from_minio(client, bucket, table_path)
+        assert counts["rows_loaded"] == t_qasm_mem.num_rows
 
     # Outcome of every check: all rules evaluated, none failed on this release.
     outcomes = {check["rule_id"]: check for check in res.details["checks"]}
@@ -390,9 +407,8 @@ def test_prepare_data_stage_execution():
     assert outcomes["RULE_SYN_HEADER_DOCUMENTED"]["outcome"] == "observed"
 
     # 1. Syndrome observations contract & invariants
-    syn_file = silver_dir / "qec_syndromes/syndrome_observation.parquet"
-    assert syn_file.exists(), "Syndrome Silver table missing"
-    t_syn = pq.read_table(syn_file)
+    syn_obj = "silver/qec_syndromes/syndrome_observation.parquet"
+    t_syn = _read_table_from_minio(client, bucket, syn_obj)
     df_syn = t_syn.to_pandas()
     assert len(df_syn) == 75598
     assert df_syn["quantity"].sum() == 70_000_000
@@ -403,9 +419,8 @@ def test_prepare_data_stage_execution():
     assert df_syn.isna().sum().sum() == 0
 
     # 2. Google experiments contract & invariants
-    exp_file = silver_dir / "google_qec/experiment.parquet"
-    assert exp_file.exists(), "Google experiment Silver table missing"
-    t_exp = pq.read_table(exp_file)
+    exp_obj = "silver/google_qec/experiment.parquet"
+    t_exp = _read_table_from_minio(client, bucket, exp_obj)
     df_exp = t_exp.to_pandas()
     assert len(df_exp) == 5
     assert df_exp["experiment_id"].is_unique
@@ -416,9 +431,8 @@ def test_prepare_data_stage_execution():
     assert (df_exp["distance"].isin([3, 5])).all()
 
     # 3. Google shots contract & invariants
-    shot_file = silver_dir / "google_qec/shot.parquet"
-    assert shot_file.exists(), "Google shot Silver table missing"
-    t_shot = pq.read_table(shot_file)
+    shot_obj = "silver/google_qec/shot.parquet"
+    t_shot = _read_table_from_minio(client, bucket, shot_obj)
     df_shot = t_shot.to_pandas()
     assert len(df_shot) == 250000
     assert df_shot["source_record_id"].is_unique
@@ -426,7 +440,6 @@ def test_prepare_data_stage_execution():
     assert (df_shot["detector_event_count"] >= 0).all()
 
     # 4. QASMBench silver-table contract
-    qasm_dir = silver_dir / "qasmbench"
     qasm_specs = {
         "circuit": [
             "source_record_id",
@@ -435,8 +448,6 @@ def test_prepare_data_stage_execution():
             "variant",
             "register_declarations",
             "qubit_count",
-            # Extra Silver field (allowed by silver-tables.md): data-sources.md
-            # lists the operation count under "At minimum, extract".
             "operation_count",
             "measurement_count",
             "two_qubit_gate_count",
@@ -459,25 +470,24 @@ def test_prepare_data_stage_execution():
         ],
     }
     for table_name, expected_columns in qasm_specs.items():
-        table_path = qasm_dir / f"{table_name}.parquet"
-        assert table_path.exists(), f"QASMBench {table_name} Silver table missing"
-        t_qasm = pq.read_table(table_path)
+        table_obj = f"silver/qasmbench/{table_name}.parquet"
+        t_qasm = _read_table_from_minio(client, bucket, table_obj)
         assert set(t_qasm.column_names) == set(expected_columns)
         assert t_qasm.num_rows > 0
 
-    t_qasm_circuit = pq.read_table(qasm_dir / "circuit.parquet")
+    t_qasm_circuit = _read_table_from_minio(client, bucket, "silver/qasmbench/circuit.parquet")
     df_qasm_circuit = t_qasm_circuit.to_pandas()
     assert df_qasm_circuit["source_record_id"].is_unique
     assert (df_qasm_circuit["qubit_count"] > 0).all()
     assert (df_qasm_circuit["measurement_count"] > 0).all()
     assert (df_qasm_circuit["two_qubit_gate_count"] >= 0).all()
 
-    t_qasm_checks = pq.read_table(qasm_dir / "stabilizer_check.parquet")
+    t_qasm_checks = _read_table_from_minio(client, bucket, "silver/qasmbench/stabilizer_check.parquet")
     df_qasm_checks = t_qasm_checks.to_pandas()
     assert df_qasm_checks["source_record_id"].is_unique
     assert (df_qasm_checks["syndrome_bit"].str.len() > 0).all()
 
-    t_qasm_corr = pq.read_table(qasm_dir / "conditional_correction.parquet")
+    t_qasm_corr = _read_table_from_minio(client, bucket, "silver/qasmbench/conditional_correction.parquet")
     df_qasm_corr = t_qasm_corr.to_pandas()
     assert df_qasm_corr["source_record_id"].is_unique
     assert (df_qasm_corr["condition_value"].astype(int) >= 0).all()
@@ -497,16 +507,16 @@ def test_prepare_data_stage_execution():
         subset=["source_record_id", "archive_member", "record_locator"]
     ).any()
 
-    # 5. Data issues schema validation
+    # 6. Data issues schema validation
     issues_file = results_dir / "data_issues.parquet"
     assert issues_file.exists(), "data_issues.parquet missing"
     t_issues = pq.read_table(issues_file)
     found = t_issues.to_pandas().groupby(["rule_id", "severity"]).size().to_dict()
     assert found == {
-        ("RULE_QASM_UNDECLARED_GATE", "warning"): 2,        # sx in two transpiled circuits
-        ("RULE_QASM_README_METRICS", "warning"): 2,         # qec_sm_n5 README counts
-        ("RULE_QASM_INFERRED_PARITY_CHECK", "info"): 4,     # checks without an ancilla register
-        ("RULE_QASM_NON_CIRCUIT_MEMBER", "info"): 13,       # READMEs, images, licences, qelib1.inc
+        ("RULE_QASM_UNDECLARED_GATE", "warning"): 2,  # sx in two transpiled circuits
+        ("RULE_QASM_README_METRICS", "warning"): 2,  # qec_sm_n5 README counts
+        ("RULE_QASM_INFERRED_PARITY_CHECK", "info"): 4,  # checks without an ancilla register
+        ("RULE_QASM_NON_CIRCUIT_MEMBER", "info"): 13,  # READMEs, images, licences, qelib1.inc
     }
     assert "rule_id" in t_issues.column_names
     assert "severity" in t_issues.column_names
