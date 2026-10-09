@@ -1,7 +1,0 @@
-variant,condition_register,condition_value,fired_checks,silent_checks,gate,target_qubit
-source,syn,1,"a[0] (q[0], q[1]) -> syn[0]",a[1],x,q[0]
-source,syn,2,"a[1] (q[1], q[2]) -> syn[1]",a[0],x,q[2]
-source,syn,3,"a[0] (q[0], q[1]) -> syn[0]; a[1] (q[1], q[2]) -> syn[1]",,x,q[1]
-transpiled,syn,1,"a[0] (q[0], q[1]) -> syn[0]",a[1],x,q[0]
-transpiled,syn,2,"a[1] (q[1], q[2]) -> syn[1]",a[0],x,q[2]
-transpiled,syn,3,"a[0] (q[0], q[1]) -> syn[0]; a[1] (q[1], q[2]) -> syn[1]",,x,q[1]

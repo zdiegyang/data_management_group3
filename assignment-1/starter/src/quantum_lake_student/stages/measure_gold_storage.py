@@ -44,7 +44,7 @@ def run(
     settings: Settings | None = None,
 ) -> StageResult:
     if settings is None:
-        settings.Settings.from_environment()
+        settings = Settings.from_environment()
 
     result = StageResult(
         stage = "measure_gold_storage",

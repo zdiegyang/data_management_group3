@@ -103,13 +103,10 @@ COMMENT ON TABLE gold.google_shot IS
     'One row = one aligned hardware shot: packed measurement/detector bytes (Stim b8 '
     'format) plus the actual logical outcome. detector_bits stores the full packed '
     'record; detector_event_count is a summary column for aggregate queries. ';
---         'Exploding to one row per fired detector event would be ~10.45M rows for the same '
---     '8.75MB of information this column already holds, with no detector query this '
---     'project needs that bit_count()/get_bit() cannot answer on the packed form.'
 CREATE INDEX ix_google_shot_experiment_shot
     ON gold.google_shot (experiment_id, shot_index);
 
--- NEW (F10): decoders are now a real lookup table instead of a free-text
+-- decoders are a lookup table instead of a free-text
 -- CHECK list repeated inline -- adding a fifth decoder is one INSERT, not a
 -- schema change, and decoder_prediction gets a real foreign key.
 CREATE TABLE gold.decoder (

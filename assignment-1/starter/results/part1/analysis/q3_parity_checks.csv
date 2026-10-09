@@ -1,5 +1,0 @@
-variant,ancilla_qubit,data_qubits,syndrome_bit
-source,a[0],"q[0], q[1]",syn[0]
-source,a[1],"q[1], q[2]",syn[1]
-transpiled,a[0],"q[0], q[1]",syn[0]
-transpiled,a[1],"q[1], q[2]",syn[1]
