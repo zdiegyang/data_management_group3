@@ -257,9 +257,9 @@ def test_report_covers_every_required_topic():
 
     # Spec: "the inputs and targets, why each simple model fits its table,
     # results, discarded information, and limitations".
-    for heading in ("## Inputs and targets", "## Why each simple model fits its table",
-                    "## Task A", "## Task B", "## Task C", "## Discarded information",
-                    "## Limitations", "What a flat 200-bit vector does not show"):
+    for heading in ("## Data and prediction targets", "## Why these models were chosen",
+                    "## Task A — Weighted syndrome decoder", "## Task B — Comparing the Google decoders", "## Task C — Testing a model on raw detector data", "## Information not used by the models",
+                    "## Limitations"):
         assert heading in report
 
 
