@@ -141,11 +141,10 @@ FROM gold.google_shot
 GROUP BY experiment_id;
 
 -- =============================================================================
--- qasmbench: circuits and their structure. No row-level join to the other two
--- sources exists (rejected relationship, see decision log) -- no foreign key out.
+-- qasmbench: circuits and their structure.
 -- =============================================================================
 
--- NEW (F10): splits "which algorithm" from "which compiled variant". Verified
+-- splits "which algorithm" from "which compiled variant". Verified
 -- against the real data: 6 circuit rows collapse to 3 distinct benchmarks,
 -- each compiled as both a source and a transpiled variant.
 CREATE TABLE gold.benchmark (
@@ -185,7 +184,7 @@ COMMENT ON TABLE gold.stabilizer_check IS
     'in check_data_qubit, not a packed array here.';
 CREATE INDEX ix_stabilizer_check_circuit ON gold.stabilizer_check (circuit_id);
 
--- NEW (F10): replaces the Silver data_qubits text[] (always length 2 or 4 in
+-- replaces the Silver data_qubits text[] (always length 2 or 4 in
 -- the real data) with one row per participating data qubit -- queryable with
 -- ordinary joins and WHERE clauses instead of array functions. position
 -- preserves the original Silver list order.
