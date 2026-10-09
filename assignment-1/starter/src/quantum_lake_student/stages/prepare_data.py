@@ -144,6 +144,10 @@ CHECK_CATALOG: dict[str, tuple[str, str, str, str]] = {
     "RULE_QASM_CIRCUIT_PARSE": ("qasmbench", "circuit registers and operation counts parse", "QASM file", "exclude circuit"),
     "RULE_QASM_STABILIZER_PARSE": ("qasmbench", "parity checks parse", "QASM file", "exclude file's checks"),
     "RULE_QASM_CORRECTION_PARSE": ("qasmbench", "conditional corrections parse", "QASM file", "exclude file's corrections"),
+    "RULE_QASM_UNDECLARED_GATE": ("qasmbench", "every gate a circuit uses is defined in the file or in its included qelib1.inc", "QASM file", "warn, keep circuit"),
+    "RULE_QASM_README_METRICS": ("qasmbench", "qubit, two-qubit-gate and gate counts in the benchmark README equal the parsed source circuit", "benchmark README", "warn, keep circuit"),
+    "RULE_QASM_INFERRED_PARITY_CHECK": ("qasmbench", "a parity check is explicit (ancilla in its own register) rather than inferred from CNOTs onto a data-register qubit", "stabilizer check", "note, keep check"),
+    "RULE_QASM_NON_CIRCUIT_MEMBER": ("qasmbench", "archive member is a .qasm circuit (others are documentation, images or licences)", "archive member", "note, skip member"),
 }
 
 
@@ -169,16 +173,21 @@ def _check_outcomes(
     issues: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Outcome of every catalogued rule: how many records it checked, passed and failed."""
-    failed_by_rule: dict[str, int] = {}
+    counts: dict[tuple[str, str], int] = {}
     for issue in issues:
-        failed_by_rule[issue["rule_id"]] = failed_by_rule.get(issue["rule_id"], 0) + 1
+        key = (issue["rule_id"], issue["severity"])
+        counts[key] = counts.get(key, 0) + 1
     outcomes = []
     for rule_id, (source, description, unit, on_failure) in CHECK_CATALOG.items():
         entry = checks.get(rule_id, {"checked": 0, "observations": []})
-        failed = failed_by_rule.get(rule_id, 0)
+        failed = counts.get((rule_id, "error"), 0)
+        warnings = counts.get((rule_id, "warning"), 0)
+        notes = counts.get((rule_id, "info"), 0)
         if failed:
             outcome = "failed"
-        elif entry["observations"]:
+        elif warnings:
+            outcome = "warning"
+        elif notes or entry["observations"]:
             outcome = "observed"
         elif entry["checked"]:
             outcome = "passed"
@@ -192,7 +201,9 @@ def _check_outcomes(
             "on_failure": on_failure,
             "checked": entry["checked"],
             "failed": failed,
-            "passed": max(entry["checked"] - failed, 0),
+            "warnings": warnings,
+            "notes": notes,
+            "passed": max(entry["checked"] - failed - warnings - notes, 0),
             "outcome": outcome,
             "observations": entry["observations"],
         })
@@ -1699,6 +1710,124 @@ def _record_same_syndrome_both_labels(
         checked=len(labels_by_syndrome),
         observation=f"{both} syndromes occur with both labels within one file; all rows kept",
     )
+    per_file: dict[str, int] = {}
+    for (experiment_id, _), labels in labels_by_syndrome.items():
+        per_file[experiment_id] = per_file.get(experiment_id, 0) + (len(labels) == 2)
+    for experiment_id in sorted(per_file):
+        _record_check(
+            checks, "RULE_SYN_SAME_SYNDROME_BOTH_LABELS", checked=0,
+            observation=f"{experiment_id}: {per_file[experiment_id]} syndromes with both labels",
+        )
+
+
+QASM_KEYWORDS = {"OPENQASM", "include", "qreg", "creg", "gate", "opaque", "measure", "barrier", "reset", "if"}
+QASM_BUILTIN_GATES = {"U", "CX"}  # OpenQASM 2 built-ins
+README_METRIC = re.compile(r"^\s*-\s*([\w ]+?)\s*:\s*([\d.]+)\s*$", re.MULTILINE)
+# README metric -> parsed column of the source-variant circuit
+README_METRICS = {
+    "Qubit Count": "qubit_count",
+    "Dual Gate Count": "two_qubit_gate_count",
+    "Gate Count": "operation_count",
+}
+
+
+def _doc_issue(issues, run_id, source_record_id, rule_id, severity, observed_value, action, reason):
+    issues.append({
+        "issue_id": _stable_issue_id(source_record_id, rule_id, observed_value),
+        "run_id": run_id,
+        "source_record_id": source_record_id,
+        "rule_id": rule_id,
+        "severity": severity,
+        "observed_value": observed_value,
+        "action": action,
+        "reason": reason,
+    })
+
+
+GATE_DECLARATION = re.compile(r"^\s*(?:gate|opaque)\s+([A-Za-z_]\w*)", re.MULTILINE)
+
+
+def _declared_gates(text: str) -> set[str]:
+    """Gate names declared with `gate` or `opaque` (one declaration per line, comments removed)."""
+    return set(GATE_DECLARATION.findall(re.sub(r"//.*", "", text)))
+
+
+def _used_gates(text: str) -> dict[str, int]:
+    """Gate names a circuit executes (gate definition bodies excluded), with counts."""
+    body = GATE_HEADER.sub("", re.sub(r"//.*", "", text))
+    used: dict[str, int] = {}
+    for statement in body.split(";"):
+        statement = " ".join(statement.split())
+        if statement.startswith("if"):
+            statement = statement.split(")", 1)[-1].strip()
+        name = re.match(r"([A-Za-z_]\w*)", statement)
+        if name and name.group(1) not in QASM_KEYWORDS:
+            used[name.group(1)] = used.get(name.group(1), 0) + 1
+    return used
+
+
+def _qasm_documentation_checks(
+    bronze_bytes: bytes,
+    run_id: str,
+    qasm_tables: dict[str, pa.Table],
+    issues: list[dict[str, Any]],
+    checks: dict[str, dict[str, Any]],
+) -> None:
+    """Compare the QASMBench circuits with their own documentation.
+
+    Nothing is excluded: these findings are warnings and notes. They make the
+    differences between the files and their documentation visible in
+    data_issues.parquet (brief: "Record the outcome of every check").
+    """
+    with zipfile.ZipFile(io.BytesIO(bronze_bytes)) as archive:
+        members = sorted(archive.namelist())
+        texts = {name: archive.read(name).decode("utf-8", errors="replace")
+                 for name in members if name.endswith((".qasm", ".md", ".inc"))}
+
+    # Non-circuit members: documentation, images and licences are skipped.
+    _record_check(checks, "RULE_QASM_NON_CIRCUIT_MEMBER", checked=len(members))
+    for name in members:
+        if not name.endswith(".qasm"):
+            _doc_issue(issues, run_id, f"qasmbench:{name}", "RULE_QASM_NON_CIRCUIT_MEMBER", "info",
+                       name, "skipped", "Not a circuit (documentation, image, licence or gate library)")
+
+    # Gates used but defined neither in the file nor in qelib1.inc.
+    library = _declared_gates(texts.get("qelib1.inc", ""))
+    for name in (n for n in members if n.endswith(".qasm")):
+        _record_check(checks, "RULE_QASM_UNDECLARED_GATE")
+        text = texts[name]
+        own = _declared_gates(text)
+        included = library if 'include "qelib1.inc"' in text else set()
+        for gate, count in sorted(_used_gates(text).items()):
+            if gate not in own | included | QASM_BUILTIN_GATES:
+                _doc_issue(issues, run_id, f"qasmbench:{name}", "RULE_QASM_UNDECLARED_GATE", "warning",
+                           f"{gate} (used {count} times)", "kept",
+                           f"Gate '{gate}' is not defined in the file or in qelib1.inc")
+
+    # README metrics vs the parsed source-variant circuit.
+    circuits = {row["benchmark_name"]: row for row in qasm_tables["circuit"].to_pylist()
+                if row["variant"] == "source"}
+    for name in (n for n in members if n.endswith("README.md") and n.count("/") == 2):
+        benchmark = name.split("/")[1]
+        if benchmark not in circuits:
+            continue
+        _record_check(checks, "RULE_QASM_README_METRICS")
+        metrics = dict(README_METRIC.findall(texts[name]))
+        for metric, column in README_METRICS.items():
+            if metric in metrics and float(metrics[metric]) != circuits[benchmark][column]:
+                _doc_issue(issues, run_id, f"qasmbench:{name}", "RULE_QASM_README_METRICS", "warning",
+                           f"{metric}: README {metrics[metric]}, parsed {circuits[benchmark][column]}",
+                           "kept", f"README '{metric}' differs from the parsed source circuit ({column})")
+
+    # Parity checks inferred from CNOTs onto a data-register qubit.
+    for row in qasm_tables["stabilizer_check"].to_pylist():
+        _record_check(checks, "RULE_QASM_INFERRED_PARITY_CHECK")
+        ancilla_register = row["ancilla_qubit"].split("[")[0]
+        if any(qubit.split("[")[0] == ancilla_register for qubit in row["data_qubits"]):
+            _doc_issue(issues, run_id, row["source_record_id"], "RULE_QASM_INFERRED_PARITY_CHECK", "info",
+                       f"{row['ancilla_qubit']} with {', '.join(row['data_qubits'])}", "kept",
+                       "No separate ancilla register: the check is inferred from CNOTs onto a qubit "
+                       "of the data register, not declared explicitly")
 
 
 def _execute_run(
@@ -1824,6 +1953,8 @@ def _execute_run(
         ("RULE_QASM_CORRECTION_PARSE", "conditional_correction"),
     ]:
         _record_check(checks, rule_id, checked=qasm_row_counts[table_name]["source_files_read"])
+    if qasm_bytes is not None:
+        _qasm_documentation_checks(qasm_bytes, run_id, qasm_tables, issues, checks)
     total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
         q_dir = silver_base / "qasmbench"
