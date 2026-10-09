@@ -1,0 +1,7 @@
+candidate_key,matching_circuits
+benchmark_name = google experiment_id,0
+benchmark_name = simulated experiment_id,0
+circuit_id = google experiment_id,0
+circuit_id = simulated experiment_id,0
+qubit_count = qubits of a google patch (2*d*d - 1),0
+source_record_id shared with a google experiment,0
