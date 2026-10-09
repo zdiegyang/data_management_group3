@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
-import subprocess
 import sys
 import traceback
 
@@ -20,7 +17,7 @@ from rich.table import Table
 from .config import Settings
 from .connections import bronze_inventory, check_platform, minio_client
 from .models import StageResult
-from .stages import load_postgres, measure_detector, prepare_data, register_sources, measure_gold_storage
+from .provenance import STARTER_DIR, code_sha256, git_revision
 from quantum_lake_student import build_trace
 from .stages import (
     build_ml_tables,
@@ -29,12 +26,13 @@ from .stages import (
     measure_gold_storage,
     prepare_data,
     register_sources,
+    run_analyses,
+    train
 )
 
 
 console = Console()
 
-STARTER_DIR = Path(__file__).resolve().parents[2]
 RESULTS_DIR = STARTER_DIR / "results" / "part1"
 
 
@@ -60,53 +58,6 @@ def command_inventory(settings: Settings) -> int:
 # Spec: run.json records "input hashes, code revision, start/end times, and
 # every output count".
 # ==============================================================================
-
-def _read_git_head(git_dir: Path) -> str | None:
-    """Resolve HEAD to a commit hash from the files in a .git directory."""
-    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-    if not head.startswith("ref: "):
-        return head or None  # detached HEAD holds the hash itself
-    ref = head[len("ref: "):]
-    if (git_dir / ref).is_file():
-        return (git_dir / ref).read_text(encoding="utf-8").strip()
-    packed = git_dir / "packed-refs"
-    if packed.is_file():
-        for line in packed.read_text(encoding="utf-8").splitlines():
-            if line.endswith(f" {ref}"):
-                return line.split()[0]
-    return None
-
-
-def git_revision(start: Path = STARTER_DIR) -> str | None:
-    """Commit hash of the code, with or without a `git` program.
-
-    The workspace container has no `git`; compose.yaml mounts the repository's
-    .git directory read-only and points QUANTUM_GIT_DIR at it.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=start, check=True, capture_output=True, text=True
-        )
-        return result.stdout.strip() or None
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    candidates = [Path(os.environ["QUANTUM_GIT_DIR"])] if os.environ.get("QUANTUM_GIT_DIR") else []
-    candidates += [directory / ".git" for directory in (start, *start.parents)]
-    for git_dir in candidates:
-        if (git_dir / "HEAD").is_file():
-            return _read_git_head(git_dir)
-    return None
-
-
-def code_sha256(root: Path = STARTER_DIR) -> str:
-    """Hash of the pipeline code (src/ and sql/), recorded even without git."""
-    digest = hashlib.sha256()
-    for path in sorted([*root.glob("src/**/*.py"), *root.glob("sql/**/*.sql")]):
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(b"\x00")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -274,11 +225,6 @@ def _run_part1_stages(
         f"{gold_measure.input_count:,} inputs -> {gold_measure.output_count:,} outputs "
         f"({gold_measure.issue_count} issues) in {duration:.2f}s"
     )
-    # # build trace
-    # trace = build_trace.run(run_id=run_id)
-    # stage_results.append(trace)
-    # console.print("[bold green]✓ build_trace.json examples")
-
     console.print("[bold green]✓ Part I PostgreSQL storage measured and saved as JSON![/bold green]")
 
     # Stage 4: Gold -> ML. Reads only Gold views; writes both ML tables to the lake.
@@ -296,19 +242,48 @@ def _run_part1_stages(
         + f" in {duration:.2f}s"
     )
 
-
-def command_train(_: Settings) -> int:
-    started_at = datetime.now(UTC)
-    run_id = f"model_{started_at.strftime('%Y%m%d_%H%M%S')}"
-
-    result = train.run(
-        model_run_id=run_id,
-        settings=settings,
+    # Stage 5: the analysis questions, as committed SQL against Gold.
+    res_analyses = run_analyses.run(run_id=run_id, settings=settings)
+    stage_results.append(res_analyses)
+    console.print(
+        f"[green]✓ Stage 5 (run_analyses):[/green] {res_analyses.input_count} queries -> "
+        "results/part1/analysis/"
     )
 
+
+def command_train(settings: Settings) -> int:
+    """Run Part II from the two materialized ML Parquet tables only."""
+    started_at = datetime.now(UTC)
+    run_id = f"model_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    console.print(f"[bold blue]Starting Part II ML stage (Run ID: {run_id})...[/bold blue]")
+
+    result = train.run(model_run_id=run_id, settings=settings)
+    duration = (
+        (result.finished_at - result.started_at).total_seconds()
+        if result.finished_at
+        else 0.0
+    )
     console.print(
-        f"[green]✓ Part II completed:[/green] "
-        f"{result.output_count} outputs"
+        f"[green]✓ Part II:[/green] {result.input_count:,} inputs -> "
+        f"{result.output_count:,} prediction rows ({result.issue_count} issues) "
+        f"in {duration:.2f}s"
+    )
+    console.print("[bold green]✓ results/part2 regenerated successfully![/bold green]")
+    return 0
+
+
+def command_trace(settings: Settings) -> int:
+    """Part I demonstration, run after `make train`: trace one syndrome and one
+    Google prediction back to Bronze into results/part1/trace_examples.json.
+
+    Kept out of `make train` because Part II may read only the two ML tables,
+    while a trace must read Gold, Silver and the source trace.
+    """
+    run_id = f"trace_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    result = build_trace.run(run_id=run_id, settings=settings)
+    console.print(
+        f"[green]✓ Trace examples:[/green] {result.input_count} predictions traced to "
+        f"{result.output_count} Bronze trace rows -> {result.details['trace_examples']}"
     )
     return 0
 
@@ -317,7 +292,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument(
         "command",
-        choices=("check", "inventory", "run", "train"),
+        choices=("check", "inventory", "run", "train", "trace"),
         help="Action to perform",
     )
     return result
@@ -331,6 +306,7 @@ def main() -> None:
         "inventory": command_inventory,
         "run": command_run,
         "train": command_train,
+        "trace": command_trace,
     }
     raise SystemExit(commands[arguments.command](settings))
 

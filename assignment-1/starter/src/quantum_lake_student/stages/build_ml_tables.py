@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,12 @@ GOOGLE_SCHEMA = pa.schema([
 
 # required-ml-tables.md: "detector_count | 200 for distance 3; 600 for distance 5".
 DETECTORS_PER_DISTANCE = {3: 200, 5: 600}
+
+# Parquet metadata key carrying the course data release. Training must record
+# "the course data-release identifier" while reading only the two ML tables,
+# so the identifier travels inside both tables.
+RELEASE_METADATA_KEY = b"quantum_lake.data_release"
+MANIFEST_KEY = "metadata/course-release/bundle-manifest.json"
 
 
 class MlContractError(RuntimeError):
@@ -189,11 +196,37 @@ def _split_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 # Writing to the lake
 # ==============================================================================
 
-def to_table(rows: list[dict[str, Any]], schema: pa.Schema) -> pa.Table:
-    """Exactly the contract columns, in contract order and types."""
-    return pa.Table.from_pylist(
+def to_table(
+    rows: list[dict[str, Any]], schema: pa.Schema, release: dict[str, Any] | None = None
+) -> pa.Table:
+    """Exactly the contract columns, in contract order and types.
+
+    The course data release is attached as Parquet metadata, not as a column,
+    so the contract columns stay exactly as specified.
+    """
+    table = pa.Table.from_pylist(
         [{field.name: row[field.name] for field in schema} for row in rows], schema=schema
     )
+    if release is not None:
+        table = table.replace_schema_metadata(
+            {RELEASE_METADATA_KEY: json.dumps(release, sort_keys=True).encode()}
+        )
+    return table
+
+
+def _read_release(settings: Settings) -> dict[str, Any]:
+    """The course data release (name, bundle version, date) from the release manifest."""
+    if settings.lake_backend == "local":
+        raw = (settings.local_lake_root / MANIFEST_KEY).read_bytes()
+    else:
+        response = minio_client(settings).get_object(settings.s3_bucket, MANIFEST_KEY)
+        try:
+            raw = response.read()
+        finally:
+            response.close()
+            response.release_conn()
+    manifest = json.loads(raw)
+    return {key: manifest[key] for key in ("release_name", "bundle_version", "release_date")}
 
 
 def _parquet_bytes(table: pa.Table) -> bytes:
@@ -247,17 +280,19 @@ def run(run_id: str, settings: Settings | None = None) -> StageResult:
     if any(unresolved.values()):
         raise MlContractError(f"example_id values that do not resolve to Gold records: {unresolved}")
 
+    release = _read_release(settings)
     outputs = {}
     for key, rows, schema in (
         (SYNDROME_KEY, syndrome_rows, SYNDROME_SCHEMA),
         (GOOGLE_KEY, google_rows, GOOGLE_SCHEMA),
     ):
-        data = _parquet_bytes(to_table(rows, schema))
+        data = _parquet_bytes(to_table(rows, schema, release))
         outputs[key] = {
             "rows": len(rows),
             "sha256": hashlib.sha256(data).hexdigest(),
             "location": _write_to_lake(settings, key, data),
             "split_counts": _split_counts(rows),
+            "data_release": release,
         }
 
     result.input_count = len(syndrome_rows) + len(google_rows)

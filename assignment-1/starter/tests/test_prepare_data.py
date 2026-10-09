@@ -352,7 +352,9 @@ def test_prepare_data_stage_execution():
     assert res.finished_at >= res.started_at
     assert res.input_count >= 325603
     assert res.output_count >= 325603
-    assert res.issue_count == 0
+    # No record is invalid; the 21 issues are QASMBench documentation findings
+    # (warnings and notes, nothing excluded) — checked in detail below.
+    assert res.issue_count == 21
 
     base_dir = Path(__file__).resolve().parents[1]
     silver_dir = base_dir / "silver"
@@ -499,6 +501,12 @@ def test_prepare_data_stage_execution():
     issues_file = results_dir / "data_issues.parquet"
     assert issues_file.exists(), "data_issues.parquet missing"
     t_issues = pq.read_table(issues_file)
-    assert t_issues.num_rows == 0
+    found = t_issues.to_pandas().groupby(["rule_id", "severity"]).size().to_dict()
+    assert found == {
+        ("RULE_QASM_UNDECLARED_GATE", "warning"): 2,        # sx in two transpiled circuits
+        ("RULE_QASM_README_METRICS", "warning"): 2,         # qec_sm_n5 README counts
+        ("RULE_QASM_INFERRED_PARITY_CHECK", "info"): 4,     # checks without an ancilla register
+        ("RULE_QASM_NON_CIRCUIT_MEMBER", "info"): 13,       # READMEs, images, licences, qelib1.inc
+    }
     assert "rule_id" in t_issues.column_names
     assert "severity" in t_issues.column_names

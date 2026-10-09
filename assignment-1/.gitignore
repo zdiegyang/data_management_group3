@@ -12,9 +12,21 @@ starter/.coverage
 # Generated Silver Parquet files
 starter/silver/**/*.parquet
 
-# Generated Part 1 results (ignore outputs, keep README)
+# Generated Part 1 results (ignore outputs, keep README). The analyses and the
+# trace examples are small, required results (brief: results/part1/analysis/,
+# results/part1/trace_examples.json), so they are kept in the repository.
 starter/results/part1/*
 !starter/results/part1/README.md
+!starter/results/part1/analysis/
+!starter/results/part1/trace_examples.json
+
+# Generated Part 2 results: `make train` regenerates models, predictions,
+# metrics, run.json and report.md (brief: do not commit large model files)
+starter/results/part2/
+
+# Course data archives are supplied separately (checklist: "Course archives
+# ... are not committed"). Place them here locally before `make bootstrap`.
+datasets/student-bundle/core/raw/
 
 # Jupyter notebook checkpoints
 **/.ipynb_checkpoints/
