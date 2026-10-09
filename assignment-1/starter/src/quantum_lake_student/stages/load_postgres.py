@@ -54,11 +54,9 @@ def _copy_load(
 ) -> int:
     """Bulk-load `rows` into `table` via COPY. Returns the number of rows sent.
 
-    No upsert logic is needed: gold_schema.sql drops and recreates every Gold
+    gold_schema.sql drops and recreates every Gold
     table at the start of this same transaction, so every table is empty when
-    this runs. "No duplicate business records on rerun" (brief) is satisfied
-    because each run fully replaces Gold from Silver rather than merging into
-    whatever was there before.
+    this runs.
     """
     rows = list(rows)
     if not rows:

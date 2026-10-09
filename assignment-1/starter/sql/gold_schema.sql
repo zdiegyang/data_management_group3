@@ -103,13 +103,10 @@ COMMENT ON TABLE gold.google_shot IS
     'One row = one aligned hardware shot: packed measurement/detector bytes (Stim b8 '
     'format) plus the actual logical outcome. detector_bits stores the full packed '
     'record; detector_event_count is a summary column for aggregate queries. ';
---         'Exploding to one row per fired detector event would be ~10.45M rows for the same '
---     '8.75MB of information this column already holds, with no detector query this '
---     'project needs that bit_count()/get_bit() cannot answer on the packed form.'
 CREATE INDEX ix_google_shot_experiment_shot
     ON gold.google_shot (experiment_id, shot_index);
 
--- NEW (F10): decoders are now a real lookup table instead of a free-text
+-- decoders are a lookup table instead of a free-text
 -- CHECK list repeated inline -- adding a fifth decoder is one INSERT, not a
 -- schema change, and decoder_prediction gets a real foreign key.
 CREATE TABLE gold.decoder (
@@ -144,11 +141,10 @@ FROM gold.google_shot
 GROUP BY experiment_id;
 
 -- =============================================================================
--- qasmbench: circuits and their structure. No row-level join to the other two
--- sources exists (rejected relationship, see decision log) -- no foreign key out.
+-- qasmbench: circuits and their structure.
 -- =============================================================================
 
--- NEW (F10): splits "which algorithm" from "which compiled variant". Verified
+-- splits "which algorithm" from "which compiled variant". Verified
 -- against the real data: 6 circuit rows collapse to 3 distinct benchmarks,
 -- each compiled as both a source and a transpiled variant.
 CREATE TABLE gold.benchmark (
@@ -188,7 +184,7 @@ COMMENT ON TABLE gold.stabilizer_check IS
     'in check_data_qubit, not a packed array here.';
 CREATE INDEX ix_stabilizer_check_circuit ON gold.stabilizer_check (circuit_id);
 
--- NEW (F10): replaces the Silver data_qubits text[] (always length 2 or 4 in
+-- replaces the Silver data_qubits text[] (always length 2 or 4 in
 -- the real data) with one row per participating data qubit -- queryable with
 -- ordinary joins and WHERE clauses instead of array functions. position
 -- preserves the original Silver list order.

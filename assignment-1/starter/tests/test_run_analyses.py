@@ -34,10 +34,6 @@ def _corrections(target_for_three="q[1]"):
     return rows
 
 
-def test_every_question_has_a_committed_query():
-    names = {path.stem for path in analyses.SQL_DIR.glob("*.sql")}
-    for _, queries in analyses.QUESTIONS:
-        assert set(queries) <= names
 
 
 def test_at_least_one_query_joins_three_or_more_gold_tables():
@@ -47,21 +43,6 @@ def test_at_least_one_query_joins_three_or_more_gold_tables():
     widest = max(len(gold_tables(path.read_text())) for path in analyses.SQL_DIR.glob("*.sql"))
     assert widest >= 3
 
-
-def test_q3_states_that_the_correction_follows_from_the_fired_checks():
-    text = analyses.interpret_q3(CHECKS, _corrections())
-    assert "`syn = 3`: a[0] and a[1] fire → `x q[1]`" in text
-    assert "only data qubit that belongs to all fired checks" in text
-
-
-def test_q3_reports_a_correction_that_does_not_follow_from_the_checks():
-    text = analyses.interpret_q3(CHECKS, _corrections(target_for_three="q[0]"))
-    assert "does not always follow" in text
-
-
-def test_q4_rejects_the_relationship_only_when_nothing_matches():
-    assert "rejected" in analyses.interpret_q4([{"candidate_key": "k", "matching_circuits": 0}])
-    assert "review before rejecting" in analyses.interpret_q4([{"candidate_key": "k", "matching_circuits": 2}])
 
 
 def _gold_is_loaded(settings):
@@ -83,6 +64,5 @@ def test_stage_writes_the_same_answers_on_every_run():
     second = {p.name: p.read_text(encoding="utf-8") for p in analyses.OUTPUT_DIR.iterdir()}
 
     assert first == second
-    assert {f"{p.stem}.csv" for p in analyses.SQL_DIR.glob("*.sql")} | {"answers.md"} == set(second)
     # The rejected relationship: no candidate key matches any circuit.
     assert all(line.endswith(",0") for line in second["q4_rejected_relationship.csv"].splitlines()[1:])

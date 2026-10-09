@@ -89,6 +89,21 @@ DATA_ISSUES_SCHEMA = pa.schema([
 ])
 
 
+def upload_table_to_minio(table: pa.Table, object_name: str, settings: Settings) -> None:
+    """Serialize a PyArrow table in memory as Parquet and upload it directly to MinIO."""
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer, compression="zstd")
+    buffer.seek(0)
+
+    client = minio_client(settings)
+    client.put_object(
+        bucket_name=settings.s3_bucket,
+        object_name=object_name,
+        data=buffer,
+        length=buffer.getbuffer().nbytes,
+        content_type="application/octet-stream",
+    )
+
 def _stable_issue_id(source_record_id: str, rule_id: str, observed_value: str) -> str:
     return f"issue_{stable_record_hash({
         'source_record_id': source_record_id,
@@ -1846,7 +1861,7 @@ def _execute_run(
 
     silver_base = base_dir / "silver"
     results_base = base_dir / "results/part1"
-    silver_base.mkdir(parents=True, exist_ok=True)
+    # silver_base.mkdir(parents=True, exist_ok=True)
     results_base.mkdir(parents=True, exist_ok=True)
 
     issues: list[dict[str, Any]] = []
@@ -1867,11 +1882,12 @@ def _execute_run(
     _record_same_syndrome_both_labels(table_syn, checks)
     total_inputs += in_syn
     total_outputs += table_syn.num_rows
+    upload_table_to_minio(table_syn, "silver/qec_syndromes/syndrome_observation.parquet", settings)
 
     syn_out_dir = silver_base / "qec_syndromes"
-    syn_out_dir.mkdir(parents=True, exist_ok=True)
+    # syn_out_dir.mkdir(parents=True, exist_ok=True)
     syn_path = syn_out_dir / "syndrome_observation.parquet"
-    pq.write_table(table_syn, syn_path, compression="zstd")
+    # pq.write_table(table_syn, syn_path, compression="zstd")
     _remember_table(
         run_state,
         "silver/qec_syndromes/syndrome_observation.parquet",
@@ -1894,11 +1910,12 @@ def _execute_run(
     } - accepted_experiments
     total_inputs += in_exp
     total_outputs += table_exp.num_rows
+    upload_table_to_minio(table_exp, "silver/google_qec/experiment.parquet", settings)
 
     google_out_dir = silver_base / "google_qec"
-    google_out_dir.mkdir(parents=True, exist_ok=True)
+    # google_out_dir.mkdir(parents=True, exist_ok=True)
     exp_path = google_out_dir / "experiment.parquet"
-    pq.write_table(table_exp, exp_path, compression="zstd")
+    # pq.write_table(table_exp, exp_path, compression="zstd")
     _remember_table(
         run_state,
         "silver/google_qec/experiment.parquet",
@@ -1913,9 +1930,10 @@ def _execute_run(
     )
     total_inputs += in_shot
     total_outputs += table_shot.num_rows
+    upload_table_to_minio(table_shot, "silver/google/shot.parquet", settings)
 
     shot_path = google_out_dir / "shot.parquet"
-    pq.write_table(table_shot, shot_path, compression="zstd")
+    # pq.write_table(table_shot, shot_path, compression="zstd")
     _remember_table(
         run_state,
         "silver/google_qec/shot.parquet",
@@ -1957,10 +1975,11 @@ def _execute_run(
         _qasm_documentation_checks(qasm_bytes, run_id, qasm_tables, issues, checks)
     total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
-        q_dir = silver_base / "qasmbench"
-        q_dir.mkdir(parents=True, exist_ok=True)
-        q_path = q_dir / f"{q_name}.parquet"
-        pq.write_table(q_table, q_path, compression="zstd")
+        # q_dir = silver_base / "qasmbench"
+        # q_dir.mkdir(parents=True, exist_ok=True)
+        # q_path = q_dir / f"{q_name}.parquet"
+        # pq.write_table(q_table, q_path, compression="zstd")
+        upload_table_to_minio(q_table, f"silver/qasmbench/{q_name}.parquet", settings)
         _remember_table(
             run_state,
             f"silver/qasmbench/{q_name}.parquet",
@@ -2052,11 +2071,11 @@ def _execute_run(
     if settings.lake_backend == "minio":
         try:
             client = minio_client(settings)
-            client.fput_object(settings.s3_bucket, "silver/qec_syndromes/syndrome_observation.parquet", str(syn_path))
-            client.fput_object(settings.s3_bucket, "silver/google_qec/experiment.parquet", str(exp_path))
-            client.fput_object(settings.s3_bucket, "silver/google_qec/shot.parquet", str(shot_path))
-            for q_name in qasm_tables:
-                client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
+            # client.fput_object(settings.s3_bucket, "silver/qec_syndromes/syndrome_observation.parquet", str(syn_path))
+            # client.fput_object(settings.s3_bucket, "silver/google_qec/experiment.parquet", str(exp_path))
+            # client.fput_object(settings.s3_bucket, "silver/google_qec/shot.parquet", str(shot_path))
+            # for q_name in qasm_tables:
+            #     client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
             client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
             client.fput_object(settings.s3_bucket, "results/part1/check_outcomes.json", str(check_outcomes_path))
