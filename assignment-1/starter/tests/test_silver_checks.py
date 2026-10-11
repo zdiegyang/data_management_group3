@@ -1,4 +1,4 @@
-"""Tests for the Silver checks added for F6-F8: companion files stop the run,
+"""Tests for the Silver checks: companion files stop the run,
 the brief's minimum checks, and the recorded outcome of every check."""
 
 import csv
@@ -78,7 +78,7 @@ def _shots(archive_bytes):
     return table, rows_read, issues, checks
 
 
-# --- F6: required companion files ------------------------------------------
+# --- Required companion files ------------------------------------------
 
 def test_missing_sweep_file_stops_run_when_sweep_bits_are_declared():
     archive_bytes = _google_archive(sweep_bits=9, omitted=("sweep.b8",))
@@ -100,7 +100,7 @@ def test_experiment_without_sweep_bits_needs_no_sweep_file():
     assert table.column("sweep_bits").to_pylist() == [b""]
 
 
-# --- F7: minimum checks from the brief --------------------------------------
+# --- Minimum checks from the brief --------------------------------------
 
 def test_weighted_total_matching_file_name_passes():
     table, issues, checks = _syndromes(
@@ -185,7 +185,7 @@ def test_nonzero_sweep_padding_bits_are_rejected():
     assert issues[0]["observed_value"] == "sweep.b8:last_byte=2"
 
 
-# --- F8: outcome of every check ---------------------------------------------
+# --- Outcome of every check ---------------------------------------------
 
 def test_check_outcomes_cover_every_rule_with_counts():
     _, issues, checks = _syndromes(

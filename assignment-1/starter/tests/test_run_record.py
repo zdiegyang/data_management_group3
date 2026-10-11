@@ -1,4 +1,4 @@
-"""Tests for F3/F4: one run.json per run, written by the CLI, with the code revision."""
+"""Tests for run.json: one record per run, written by the CLI, with the code revision."""
 
 import json
 from datetime import UTC, datetime

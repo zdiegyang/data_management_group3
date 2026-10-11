@@ -4,7 +4,7 @@ Implements Stage 2 of the course platform:
 - Syndromes CSV parsing, validation, and 16-byte packed formatting.
 - Google QEC experiments metadata extraction from properties.yml.
 - Google QEC shots parsing with 8-member companion alignment and bit-level invariant checks.
-- Extensible hook for QASMBench parsing (prepared for Diego to complete).
+- QASMBench parsing of circuits, parity checks and conditional corrections.
 - Full source lineage tracing with 'valid' (yes/no) column.
 - Machine-readable data issues logging to results/part1/data_issues.parquet.
 """

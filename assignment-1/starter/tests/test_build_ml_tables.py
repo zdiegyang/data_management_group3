@@ -1,4 +1,4 @@
-"""Tests for Stage 4: Gold -> the two required ML input tables (R1-R3)."""
+"""Tests for Stage 4: Gold -> the two required ML input tables."""
 
 import io
 import zipfile
