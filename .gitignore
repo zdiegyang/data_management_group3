@@ -5,6 +5,7 @@ assignment-1/starter/results/part1/*
 !assignment-1/starter/results/part1/README.md
 !assignment-1/starter/results/part1/analysis/
 !assignment-1/starter/results/part1/trace_examples.json
+!assignment-1/starter/results/part1/report_part1.pdf
 .idea
 .venv
 .DS_Store
