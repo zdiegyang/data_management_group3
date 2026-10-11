@@ -45,13 +45,14 @@ def _silver_snapshot(settings: Settings):
     return snapshot
 
 
-def test_prepare_data_is_repeatable():
+def test_prepare_data_is_repeatable(tmp_path):
     settings = Settings.from_environment()
 
-    prepare_data.run("repeatability-run-1", settings=settings)
+    # Result files go to tmp_path so the last `make run` results stay intact.
+    prepare_data.run("repeatability-run-1", settings=settings, results_dir=tmp_path / "run-1")
     first = _silver_snapshot(settings)
 
-    prepare_data.run("repeatability-run-2", settings=settings)
+    prepare_data.run("repeatability-run-2", settings=settings, results_dir=tmp_path / "run-2")
     second = _silver_snapshot(settings)
 
     assert first == second

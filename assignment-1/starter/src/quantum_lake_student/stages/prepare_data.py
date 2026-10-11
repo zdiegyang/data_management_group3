@@ -349,7 +349,7 @@ def _record_failed_run(
     base_dir = run_state["base_dir"]
     if result is None:
         result = StageResult(stage="prepare_data", run_id=run_id)
-    results_base = base_dir / "results/part1"
+    results_base = run_state.get("results_dir") or base_dir / "results/part1"
     results_base.mkdir(parents=True, exist_ok=True)
     result.finish()
 
@@ -396,7 +396,7 @@ def _record_failed_run(
         logging.exception("Could not persist failed run row counts for %s", run_id)
 
     settings = run_state.get("settings")
-    if settings and settings.lake_backend == "minio":
+    if run_state.get("results_dir") is None and settings and settings.lake_backend == "minio":
         try:
             client = minio_client(settings)
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
@@ -1689,9 +1689,16 @@ def _parse_conditional_corrections(member, text):
 # MAIN STAGE 2 RUNNER
 # ==============================================================================
 
-def run(run_id: str, settings: Settings | None = None) -> StageResult:
+def run(run_id: str, settings: Settings | None = None, results_dir: Path | None = None) -> StageResult:
+    """Run Stage 2.
+
+    results_dir lets tests write the result files to a temporary folder; they
+    are then not uploaded to MinIO either, so the evidence of the last
+    `make run` stays intact. Silver is always written to MinIO.
+    """
     run_state: dict[str, Any] = {
         "base_dir": Path(__file__).resolve().parents[3],
+        "results_dir": results_dir,
         "input_hashes": {},
         "row_counts": {},
         "output_table_counts": {},
@@ -1859,9 +1866,8 @@ def _execute_run(
     run_state["result"] = result
     run_state["settings"] = settings
 
-    silver_base = base_dir / "silver"
-    results_base = base_dir / "results/part1"
-    # silver_base.mkdir(parents=True, exist_ok=True)
+    publish_results = run_state.get("results_dir") is None
+    results_base = run_state.get("results_dir") or base_dir / "results/part1"
     results_base.mkdir(parents=True, exist_ok=True)
 
     issues: list[dict[str, Any]] = []
@@ -1883,11 +1889,6 @@ def _execute_run(
     total_inputs += in_syn
     total_outputs += table_syn.num_rows
     upload_table_to_minio(table_syn, "silver/qec_syndromes/syndrome_observation.parquet", settings)
-
-    syn_out_dir = silver_base / "qec_syndromes"
-    # syn_out_dir.mkdir(parents=True, exist_ok=True)
-    syn_path = syn_out_dir / "syndrome_observation.parquet"
-    # pq.write_table(table_syn, syn_path, compression="zstd")
     _remember_table(
         run_state,
         "silver/qec_syndromes/syndrome_observation.parquet",
@@ -1911,11 +1912,6 @@ def _execute_run(
     total_inputs += in_exp
     total_outputs += table_exp.num_rows
     upload_table_to_minio(table_exp, "silver/google_qec/experiment.parquet", settings)
-
-    google_out_dir = silver_base / "google_qec"
-    # google_out_dir.mkdir(parents=True, exist_ok=True)
-    exp_path = google_out_dir / "experiment.parquet"
-    # pq.write_table(table_exp, exp_path, compression="zstd")
     _remember_table(
         run_state,
         "silver/google_qec/experiment.parquet",
@@ -1930,10 +1926,7 @@ def _execute_run(
     )
     total_inputs += in_shot
     total_outputs += table_shot.num_rows
-    upload_table_to_minio(table_shot, "silver/google/shot.parquet", settings)
-
-    shot_path = google_out_dir / "shot.parquet"
-    # pq.write_table(table_shot, shot_path, compression="zstd")
+    upload_table_to_minio(table_shot, "silver/google_qec/shot.parquet", settings)
     _remember_table(
         run_state,
         "silver/google_qec/shot.parquet",
@@ -1975,10 +1968,6 @@ def _execute_run(
         _qasm_documentation_checks(qasm_bytes, run_id, qasm_tables, issues, checks)
     total_inputs += sum(counts["rows_read"] for counts in qasm_row_counts.values())
     for q_name, q_table in qasm_tables.items():
-        # q_dir = silver_base / "qasmbench"
-        # q_dir.mkdir(parents=True, exist_ok=True)
-        # q_path = q_dir / f"{q_name}.parquet"
-        # pq.write_table(q_table, q_path, compression="zstd")
         upload_table_to_minio(q_table, f"silver/qasmbench/{q_name}.parquet", settings)
         _remember_table(
             run_state,
@@ -2001,7 +1990,9 @@ def _execute_run(
         )
         for k in trace_syn
     }
-    trace_rows_loaded = save_source_traces(all_trace_cols, "all", trace_path, settings=settings)
+    trace_rows_loaded = save_source_traces(
+        all_trace_cols, "all", trace_path, settings=settings if publish_results else None
+    )
     _remember_table(
         run_state,
         "results/part1/source_trace.parquet",
@@ -2068,14 +2059,9 @@ def _execute_run(
     # --------------------------------------------------------------------------
     # 7. Upload to MinIO (if configured)
     # --------------------------------------------------------------------------
-    if settings.lake_backend == "minio":
+    if publish_results and settings.lake_backend == "minio":
         try:
             client = minio_client(settings)
-            # client.fput_object(settings.s3_bucket, "silver/qec_syndromes/syndrome_observation.parquet", str(syn_path))
-            # client.fput_object(settings.s3_bucket, "silver/google_qec/experiment.parquet", str(exp_path))
-            # client.fput_object(settings.s3_bucket, "silver/google_qec/shot.parquet", str(shot_path))
-            # for q_name in qasm_tables:
-            #     client.fput_object(settings.s3_bucket, f"silver/qasmbench/{q_name}.parquet", str(silver_base / "qasmbench" / f"{q_name}.parquet"))
             client.fput_object(settings.s3_bucket, "results/part1/data_issues.parquet", str(issues_path))
             client.fput_object(settings.s3_bucket, "results/part1/row_counts.json", str(row_counts_path))
             client.fput_object(settings.s3_bucket, "results/part1/check_outcomes.json", str(check_outcomes_path))

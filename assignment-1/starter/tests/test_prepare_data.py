@@ -1,6 +1,5 @@
 """Tests for Stage 2: prepare_data and source lineage tracing."""
 
-from pathlib import Path
 import csv
 import io
 import json
@@ -355,10 +354,12 @@ def test_google_shot_missing_companion_file_stops_run():
     assert issues[0]["action"] == "stopped run"
 
 
-def test_prepare_data_stage_execution():
+def test_prepare_data_stage_execution(tmp_path):
     """Verify that Stage 2 runs end-to-end, producing verified Silver tables and traces."""
     settings = Settings.from_environment()
-    res = prepare_data.run("test_verification_run", settings=settings)
+    # Result files go to tmp_path so the last `make run` results stay intact.
+    results_dir = tmp_path / "results/part1"
+    res = prepare_data.run("test_verification_run", settings=settings, results_dir=results_dir)
 
     assert res.stage == "prepare_data"
     assert res.finished_at is not None
@@ -371,9 +372,6 @@ def test_prepare_data_stage_execution():
 
     client = minio_client(settings)
     bucket = settings.s3_bucket
-
-    base_dir = Path(__file__).resolve().parents[1]
-    results_dir = base_dir / "results/part1"
 
     row_counts_file = results_dir / "row_counts.json"
     assert row_counts_file.exists(), "row_counts.json missing"
